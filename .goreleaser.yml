@@ -33,11 +33,12 @@ homebrew_casks:
     homepage: https://github.com/yousysadmin/igit
     description: Review and GIT tools
     license: MIT
-    hooks:
-      post:
-        # the release binaries are unsigned, so Gatekeeper quarantines them
-        install: |
-          if system_command("/usr/bin/xattr", args: ["-h"], print_stderr: false).exit_status == 0
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/igit"]
-          end
-
+    # goreleaser still emits Homebrew's deprecated postflight stanza from
+    # hooks, so the steps form is written by hand until v2.19 ships the fix.
+    # paths in a cask steps block are relative to the staged path.
+    custom_block: |
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "igit"], chdir: "."
+        end
+      end
