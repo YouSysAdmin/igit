@@ -1,0 +1,464 @@
+package tui
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/yousysadmin/igit/internal/git"
+	"github.com/yousysadmin/igit/internal/keymap"
+	"github.com/yousysadmin/igit/internal/tui/overlay"
+	"github.com/yousysadmin/igit/internal/tui/sidepane"
+	"github.com/yousysadmin/igit/internal/tui/style"
+)
+
+// View renders the full TUI.
+func (m Model) View() string {
+	if !m.ready {
+		return "loading..."
+	}
+	// ready but the first filesLoadedMsg hasn't landed yet - the file tree is still
+	// nil-populated and the diff pane has no file selected. Showing the empty two-pane
+	// layout here would flash a misleading "no changes" state for as long as ChangedFiles
+	// takes to return (can be 100-500ms on large repos).
+	if !m.filesLoaded {
+		return "loading files..."
+	}
+
+	ph := m.paneHeight()
+
+	// determine diff pane inner width up front so the header can be truncated
+	// to a single visual row before lipgloss renders. without truncation, a
+	// long filename causes lipgloss to soft-wrap the header onto multiple
+	// rows, which would push viewport rows past applyScrollbar's hardcoded
+	// diffScrollbarFirstViewportRow offset.
+	var diffPaneW int
+	if m.treePaneHidden() {
+		diffPaneW = m.layout.width - 2
+	} else {
+		diffPaneW = m.layout.width - m.layout.treeWidth - 4
+	}
+
+	// diff pane title
+	diffTitle := "no file selected"
+	if m.file.name != "" {
+		diffTitle = m.file.name
+		if m.file.oldName != "" && m.file.oldName != m.file.name {
+			diffTitle = m.file.oldName + " → " + m.file.name
+		}
+	}
+	diffHeader := m.resolver.Style(style.StyleKeyDirEntry).Render(m.truncateHeaderTitle(diffTitle, diffPaneW))
+	parts := append([]string{diffHeader}, m.renderHeaderNote(diffPaneW)...)
+	parts = append(parts, m.layout.viewport.View())
+	diffContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	var mainView string
+	switch {
+	case m.treePaneHidden():
+		// tree pane hidden (user toggle or single file): diff uses full width
+		diffContent = m.padContentBg(diffContent, diffPaneW, m.resolver.Color(style.ColorKeyDiffPaneBg))
+		paneStyle := style.StyleKeyDiffPaneActive
+		if m.host.unfocused {
+			paneStyle = style.StyleKeyDiffPane // the host's side pane owns the focus
+		}
+		diffPane := m.resolver.Style(paneStyle).
+			Width(diffPaneW).
+			Height(ph).
+			Render(diffContent)
+		mainView = m.applyScrollbar(diffPane)
+
+	default:
+		annotated := m.annotatedFiles()
+		treeContent := m.tree.Render(sidepane.FileTreeRender{
+			Width: m.layout.treeWidth, Height: ph, Annotated: annotated, StageMarked: m.stagePlanFiles(),
+			Resolver: m.resolver, MarkRenderer: m.renderer,
+		})
+		mainView = m.renderTwoPaneLayout(treeContent, diffContent, m.tree.ScrollState(), ph, diffPaneW)
+	}
+
+	if !m.host.embedded { // the commit model composes the shared overlay over its whole view
+		mainView = m.overlay.Compose(mainView, overlay.RenderCtx{Width: m.layout.width, Height: m.layout.height, Resolver: m.resolver})
+	}
+
+	if m.cfg.noStatusBar {
+		return mainView
+	}
+
+	status := m.resolver.Style(style.StyleKeyStatusBar).Width(m.layout.width).Render(m.statusBarText())
+	return lipgloss.JoinVertical(lipgloss.Left, mainView, status)
+}
+
+// renderTwoPaneLayout renders a two-pane layout with the tree on the left and the diff on the right.
+// applies focus-based pane styles, background padding, scrollbars, and joins horizontally.
+// diffPaneW is the inner width caller passed to truncateHeaderTitle and must
+// match the lipgloss Width() applied here - single source of truth for the
+// scrollbar's single-line-header invariant.
+func (m Model) renderTwoPaneLayout(leftContent, diffContent string, leftScroll sidepane.ScrollState, ph, diffPaneW int) string {
+	treeStyle := m.resolver.Style(style.StyleKeyTreePane)
+	diffStyle := m.resolver.Style(style.StyleKeyDiffPane)
+	if m.layout.focus == paneTree {
+		treeStyle = m.resolver.Style(style.StyleKeyTreePaneActive)
+	} else {
+		diffStyle = m.resolver.Style(style.StyleKeyDiffPaneActive)
+	}
+
+	leftContent = m.padContentBg(leftContent, m.layout.treeWidth, m.resolver.Color(style.ColorKeyTreePaneBg))
+	diffContent = m.padContentBg(diffContent, diffPaneW, m.resolver.Color(style.ColorKeyDiffPaneBg))
+
+	leftPane := treeStyle.
+		Width(m.layout.treeWidth).
+		Height(ph).
+		Render(leftContent)
+	leftPane = m.applyNavigationScrollbar(leftPane, leftScroll)
+
+	diffPane := diffStyle.
+		Width(diffPaneW).
+		Height(ph).
+		Render(diffContent)
+	diffPane = m.applyScrollbar(diffPane)
+
+	return lipgloss.JoinHorizontal(lipgloss.Top, leftPane, diffPane)
+}
+
+// truncateHeaderTitle returns the diff pane header text shortened to fit
+// in exactly one visual row of width paneW, prefixed with the leading
+// single-cell space the header always renders with. control characters
+// (newline, ESC, etc.) are stripped first so crafted filenames cannot
+// re-wrap the header. left-truncation keeps the meaningful end of long
+// paths. extreme-narrow paneW values (<= 1) delegate to truncateLeftToWidth
+// without the leading space. these are not produced by any realistic
+// terminal layout but the helper must not overflow.
+func (m Model) truncateHeaderTitle(title string, paneW int) string {
+	clean := style.SanitizeFilenameForDisplay(title)
+	full := " " + clean
+	if lipgloss.Width(full) <= paneW {
+		return full
+	}
+	if paneW <= 1 {
+		return style.TruncateLeftToWidth(clean, paneW)
+	}
+	// paneW >= 2: " " + truncateLeftToWidth(clean, paneW-1) fits in paneW
+	return " " + style.TruncateLeftToWidth(clean, paneW-1)
+}
+
+// transientHint returns the first non-empty transient status-bar hint. hints
+// are cleared on the next key press (see handleKey). priority matches the
+// display order: reload > output > compact > editor > keys > vim. returns ""
+// when no hint is set. chord (keys) hints and vim-motion hints are lowest
+// priority - an in-flight reload or a mode/action hint wins, since those hints
+// are user-driven and recoverable. vim hints sit below keys since vim-motion
+// feedback is the most recoverable of the group.
+func (m Model) transientHint() string {
+	switch {
+	case m.pr.hint != "":
+		return m.pr.hint
+	case m.reload.hint != "":
+		return m.reload.hint
+	case m.stage.hint != "":
+		return m.stage.hint
+	case m.output.hint != "":
+		return m.output.hint
+	case m.compact.hint != "":
+		return m.compact.hint
+	case m.editorState.hint != "":
+		return m.editorState.hint
+	case m.keys.hint != "":
+		return m.keys.hint
+	}
+	return ""
+}
+
+// statusBarText returns context-sensitive status line content.
+// shows search input (when typing), or filename, diff stats, hunk position,
+// search match position, mode indicators, and right-aligned annotation count + help hint.
+func (m Model) statusBarText() string {
+	if m.search.active {
+		return m.searchBarText()
+	}
+
+	if m.output.saving {
+		return "save to: " + m.output.input.Value() + "  [enter] write  [esc] cancel"
+	}
+
+	if m.inConfirmDiscard {
+		return fmt.Sprintf("discard %d annotations? [y/n]", m.store.Count())
+	}
+
+	if m.annot.annotating {
+		return "[enter] save  [esc] cancel"
+	}
+
+	if hint := m.transientHint(); hint != "" {
+		return hint
+	}
+
+	// build left-side segments
+	var segments []string
+
+	// filename and diff stats segments. sanitize the filename so crafted
+	// paths (newline/ESC/bidi controls) cannot break or spoof status-bar
+	// layout - same defense-in-depth applied to the diff header.
+	cleanName := style.SanitizeFilenameForDisplay(m.file.name)
+	if cleanName != "" {
+		segments = append(segments, cleanName, m.fileStatsText())
+	}
+
+	// hunk position (always shown in diff pane when there are hunks)
+	if hs := m.hunkSegment(); hs != "" {
+		segments = append(segments, hs)
+	}
+
+	// line number position
+	if ls := m.lineNumberSegment(); ls != "" {
+		segments = append(segments, ls)
+	}
+
+	// search match position
+	if ss := m.searchSegment(); ss != "" {
+		segments = append(segments, ss)
+	}
+
+	// build right-side segments
+	var rightParts []string
+	if rc := m.tree.ReviewedCount(); rc > 0 {
+		rightParts = append(rightParts, fmt.Sprintf("✓ %d/%d", rc, m.tree.TotalFiles()))
+	}
+	if cnt := m.store.Count(); cnt > 0 {
+		suffix := "annotations"
+		if cnt == 1 {
+			suffix = "annotation"
+		}
+		rightParts = append(rightParts, fmt.Sprintf("%d %s", cnt, suffix))
+	}
+	if n := m.stage.plan.Count(); n > 0 {
+		rightParts = append(rightParts, fmt.Sprintf("stage: %d", n))
+	}
+	rightParts = append(rightParts, m.statusModeIcons())
+	if help := statusHelpHint(m.keymap); help != "" {
+		rightParts = append(rightParts, help)
+	}
+
+	// build separator with muted foreground using raw ANSI (not lipgloss.Render)
+	// to avoid full reset that would break the status bar background
+	sep := m.renderer.StatusBarSeparator()
+	left := strings.Join(segments, sep)
+	right := strings.Join(rightParts, sep)
+
+	// truncate filename from left with ... if status line is too wide
+	minRight := lipgloss.Width(right) + 5 // 2 for status bar padding + 3 for separator
+	available := max(m.layout.width-minRight, 0)
+
+	// graceful degradation: drop left segments when too narrow
+	if lipgloss.Width(left) > available {
+		// rebuild without search position
+		segments = m.statusSegmentsNoSearch()
+		left = strings.Join(segments, sep)
+	}
+	if lipgloss.Width(left) > available {
+		// rebuild without hunk info and line number
+		segments = m.statusSegmentsMinimal()
+		left = strings.Join(segments, sep)
+	}
+	if lipgloss.Width(left) > available && cleanName != "" {
+		// truncate filename from left, keeping end of path. uses display-width
+		// measurement to handle wide characters (CJK, emoji)
+		statsStr := m.fileStatsText()
+		nameMax := max(available-lipgloss.Width(statsStr)-lipgloss.Width(sep), 4) // reserve separator between name and stats
+		left = style.TruncateLeftToWidth(cleanName, nameMax) + sep + statsStr
+	}
+
+	// the legend fills what the segments and the right block leave, so a narrow
+	// bar drops hints instead of wrapping
+	budget := m.layout.width - lipgloss.Width(left) - lipgloss.Width(right) - 4
+	if legend := renderLegend(m.keymap, budget, m.legendItems()...); legend != "" {
+		left += "  " + legend
+	}
+
+	return m.joinStatusSections(left, right, sep)
+}
+
+// legendItems lists the key hints for the focused pane, the review-mode
+// counterpart of the commit-mode legends. Stage-plan hints only appear where
+// marking is possible, so the bar never names a key that does nothing.
+func (m Model) legendItems() []legendItem {
+	mode := legendItem{action: keymap.ActionToggleMode, label: "commit"}
+	if m.layout.focus == paneTree {
+		items := []legendItem{{action: keymap.ActionConfirm, label: "open", prefer: "enter"}, {action: keymap.ActionAnnotateFile, label: "annotate file"}}
+		if m.stage.applicable {
+			items = append(items, legendItem{action: keymap.ActionStageMarkFile, label: "mark file"})
+		}
+		return append(items, legendItem{action: keymap.ActionMarkReviewed, label: "reviewed"}, legendItem{action: keymap.ActionFilter, label: "filter"}, mode)
+	}
+	items := []legendItem{{action: keymap.ActionConfirm, label: "annotate"}}
+	if m.stage.applicable {
+		items = append(items,
+			legendItem{action: keymap.ActionStageMark, label: "mark"},
+			legendItem{action: keymap.ActionVisualRange, label: "range"},
+		)
+		if !m.stage.plan.Empty() {
+			items = append(items, legendItem{action: keymap.ActionCommitWithPlan, label: "stage and commit"})
+		}
+	}
+	return append(items, legendItem{action: keymap.ActionSearch, label: "search"}, legendItem{action: keymap.ActionTogglePane, label: "back"}, mode)
+}
+
+// hunkSegment returns a formatted hunk position string for the status line.
+// returns "hunk X/Y" when cursor is on a changed line, "N hunks"/"1 hunk" otherwise, or empty if not in diff pane.
+func (m Model) hunkSegment() string {
+	if m.layout.focus != paneDiff {
+		return ""
+	}
+	cur, total := m.currentHunk()
+	if total == 0 {
+		return ""
+	}
+	if cur > 0 {
+		return fmt.Sprintf("hunk %d/%d", cur, total)
+	}
+	if total == 1 {
+		return "1 hunk"
+	}
+	return fmt.Sprintf("%d hunks", total)
+}
+
+// lineNumberSegment returns a formatted line number string like "L:42/380" for the status line.
+// The denominator is dynamic: on removed lines it shows the old file's max line number,
+// on context/added lines it shows the new file's max line number.
+// Returns empty string when focus is not on diff pane, cursor is out of range, or on a divider line.
+func (m Model) lineNumberSegment() string {
+	if m.layout.focus != paneDiff {
+		return ""
+	}
+	if m.nav.diffCursor < 0 || m.nav.diffCursor >= len(m.file.lines) {
+		return ""
+	}
+	dl := m.file.lines[m.nav.diffCursor]
+	if dl.ChangeType == git.ChangeDivider {
+		return ""
+	}
+	lineNum := m.diffLineNum(dl)
+	if lineNum == 0 {
+		return ""
+	}
+	var maxOld, maxNew int
+	for _, l := range m.file.lines {
+		if l.OldNum > maxOld {
+			maxOld = l.OldNum
+		}
+		if l.NewNum > maxNew {
+			maxNew = l.NewNum
+		}
+	}
+	total := maxNew
+	if dl.ChangeType == git.ChangeRemove {
+		total = maxOld
+	}
+	if total == 0 {
+		return ""
+	}
+	return fmt.Sprintf("L:%d/%d", lineNum, total)
+}
+
+// joinStatusSections joins left and right status sections with padding and separators.
+func (m Model) joinStatusSections(left, right, sep string) string {
+	return joinStatusSections(m.layout.width, left, right, sep)
+}
+
+// searchBarText returns the status bar content during search input mode.
+func (m Model) searchBarText() string {
+	return "/" + m.search.input.Value()
+}
+
+// searchSegment returns a formatted search position string like "X/Y" for the status line.
+// returns empty string when no search matches exist. shows 0/N when all matches are hidden
+// in collapsed mode (e.g. matches only on removed lines).
+func (m Model) searchSegment() string {
+	if len(m.search.matches) == 0 {
+		return ""
+	}
+	pos := m.search.cursor + 1
+	if m.modes.collapsed.enabled && m.search.cursor < len(m.search.matches) {
+		hunks := m.findHunks()
+		if m.isCollapsedHidden(m.search.matches[m.search.cursor], hunks) {
+			pos = 0
+		}
+	}
+	return fmt.Sprintf("%d/%d", pos, len(m.search.matches))
+}
+
+// padContentBg pads every line in content to targetWidth using the given ANSI background color.
+// strips trailing plain spaces first (left by viewport/lipgloss padding after \033[0m reset),
+// then re-pads with bg-colored spaces. this ensures the background fills the entire pane
+// interior, working around lipgloss full-reset that kills outer pane backgrounds.
+// no-op when bg is empty.
+func (m Model) padContentBg(content string, targetWidth int, bg style.Color) string {
+	if bg == "" || targetWidth <= 0 {
+		return content
+	}
+
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		// strip trailing plain spaces left by viewport/lipgloss padding after ANSI reset
+		trimmed := strings.TrimRight(line, " ")
+		w := lipgloss.Width(trimmed)
+		pad := targetWidth - w
+		if pad > 0 {
+			lines[i] = trimmed + string(bg) + strings.Repeat(" ", pad) + "\033[49m"
+		} else {
+			lines[i] = trimmed
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// statusModeIcons returns the review-mode view-toggle strip.
+func (m Model) statusModeIcons() string {
+	return renderStatusIcons(m.resolver, m.statusIndicators())
+}
+
+// statusIndicators lists the review-mode view toggles and their state. Every
+// toggle the mode owns is listed, the strip shows it muted while it is off.
+func (m Model) statusIndicators() []statusIndicator {
+	reviewAction := keymap.ActionMarkReviewed
+	if m.tree.UnreviewedFilterActive() {
+		reviewAction = keymap.ActionFilterUnreviewed
+	}
+	return []statusIndicator{
+		{keymap.ActionToggleCollapsed, m.paneToggleOn(toggleCollapsed)},
+		{keymap.ActionToggleCompact, m.paneToggleOn(toggleCompact)},
+		{keymap.ActionFilter, m.tree.FilterActive()},
+		{keymap.ActionToggleWrap, m.paneToggleOn(toggleWrap)},
+		{keymap.ActionSearch, len(m.paneSearchMatches()) > 0},
+		{keymap.ActionToggleTree, m.layout.treeHidden},
+		{keymap.ActionToggleLineNums, m.paneToggleOn(toggleLineNumbers)},
+		{keymap.ActionToggleBlame, m.paneToggleOn(toggleBlame)},
+		{keymap.ActionToggleWordDiff, m.paneToggleOn(toggleWordDiff)},
+		{reviewAction, m.tree.ReviewedCount() > 0 || m.tree.UnreviewedFilterActive()},
+		{keymap.ActionToggleUntracked, !m.modes.showUntracked},
+	}
+}
+
+// statusSegmentsNoSearch returns left segments without search position (for narrow terminals).
+func (m Model) statusSegmentsNoSearch() []string {
+	var segments []string
+	if name := style.SanitizeFilenameForDisplay(m.file.name); name != "" {
+		segments = append(segments, name, m.fileStatsText())
+	}
+	if hs := m.hunkSegment(); hs != "" {
+		segments = append(segments, hs)
+	}
+	if ls := m.lineNumberSegment(); ls != "" {
+		segments = append(segments, ls)
+	}
+	return segments
+}
+
+// statusSegmentsMinimal returns left segments with only filename and stats.
+func (m Model) statusSegmentsMinimal() []string {
+	var segments []string
+	if name := style.SanitizeFilenameForDisplay(m.file.name); name != "" {
+		segments = append(segments, name, m.fileStatsText())
+	}
+	return segments
+}

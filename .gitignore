@@ -1,0 +1,38 @@
+# binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+.bin/
+/igit
+
+# test files
+*.test
+coverage.out
+coverage_no_mocks.out
+profile.cov
+
+# ide and editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# os files
+.DS_Store
+Thumbs.db
+
+# build artifacts
+dist/
+
+# local configuration
+.env
+.env.local
+*.local.yml
+*.local.yaml
+
+# debug
+__debug_bin*

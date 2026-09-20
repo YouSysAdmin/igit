@@ -1,0 +1,825 @@
+package tui
+
+import (
+	"fmt"
+	"log"
+	"maps"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-runewidth"
+
+	"github.com/yousysadmin/igit/internal/git"
+	"github.com/yousysadmin/igit/internal/tui/worddiff"
+)
+
+// appendStagedEntries adds the index side to a worktree listing. Outside a
+// merge only files new to the index qualify, they have no worktree diff of
+// their own. During one every staged path does, the merge is reviewed whole.
+func (m Model) appendStagedEntries(entries []git.FileEntry, mergeResult bool) ([]git.FileEntry, string) {
+	staged, err := m.diffSource.ChangedFiles("", true)
+	if err != nil {
+		return entries, fmt.Sprintf("staged files: %v", err)
+	}
+	listed := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		listed[e.Path] = true
+	}
+	for _, se := range staged {
+		if listed[se.Path] || (!mergeResult && se.Status != git.FileAdded) {
+			continue
+		}
+		entries = append(entries, se)
+	}
+	return entries, ""
+}
+
+// loadFiles returns a command that fetches the list of changed files from the renderer.
+// it also appends staged-only and untracked files when applicable.
+// the caller must bump m.filesLoadSeq before invoking loadFiles when issuing a new
+// reload (e.g. toggleUntracked). the captured seq tags every emitted filesLoadedMsg
+// so handleFilesLoaded can drop stale results from earlier in-flight loads.
+func (m Model) loadFiles() tea.Cmd {
+	seq := m.filesLoadSeq
+	reviewed := m.tree.ReviewedFingerprints()
+	return func() tea.Msg {
+		var warnings []string
+		entries, err := m.diffSource.ChangedFiles(m.session.ref, m.session.staged)
+		if err != nil {
+			return filesLoadedMsg{seq: seq, entries: entries, err: err}
+		}
+		// include staged-only files (new files added to index but not yet committed)
+		// only when there are no unstaged entries, otherwise unstaged review should stay focused
+		// on actual unstaged changes. An unfinished merge is the exception: a
+		// conflict already resolved has no unstaged diff left, yet it is part of
+		// what the merge will commit, so the whole result is reviewed together.
+		worktreeReview := m.session.ref == "" && !m.session.staged
+		mergeResult := worktreeReview && m.session.mergeInProgress
+		if worktreeReview && (len(entries) == 0 || mergeResult) {
+			var stagedWarning string
+			entries, stagedWarning = m.appendStagedEntries(entries, mergeResult)
+			if stagedWarning != "" {
+				warnings = append(warnings, stagedWarning)
+			}
+		}
+		// append untracked files when toggle is on (skip files already in entries to avoid dupes)
+		if m.modes.showUntracked && m.loadUntracked != nil {
+			ut, utErr := m.loadUntracked()
+			if utErr != nil {
+				warnings = append(warnings, fmt.Sprintf("untracked files: %v", utErr))
+			} else {
+				renames, rWarn := m.detectUntrackedRenames(ut)
+				if rWarn != "" {
+					warnings = append(warnings, rWarn)
+				}
+				entries = m.mergeUntrackedEntries(entries, ut, renames)
+			}
+		}
+		fingerprints, fingerprintWarnings := m.loadReviewedFingerprints(entries, reviewed)
+		warnings = append(warnings, fingerprintWarnings...)
+		return filesLoadedMsg{
+			seq:                  seq,
+			entries:              entries,
+			reviewedBefore:       reviewed,
+			reviewedFingerprints: fingerprints,
+			warnings:             warnings,
+		}
+	}
+}
+
+const maxReviewFingerprintWorkers = 4
+
+// loadReviewedFingerprints refreshes identities only for paths that were
+// reviewed before this file-list load. A small worker pool prevents a large
+// review from serializing one VCS process per file without creating unbounded
+// subprocess concurrency.
+func (m Model) loadReviewedFingerprints(entries []git.FileEntry, reviewed map[string]string) (map[string]string, []string) {
+	current := make(map[string]string, len(reviewed))
+	if len(reviewed) == 0 {
+		return current, nil
+	}
+
+	jobs := make([]git.FileEntry, 0, len(reviewed))
+	for _, entry := range entries {
+		if _, ok := reviewed[entry.Path]; ok {
+			jobs = append(jobs, entry)
+		}
+	}
+	if len(jobs) == 0 {
+		return current, nil
+	}
+
+	type fingerprintResult struct {
+		path        string
+		fingerprint string
+		stable      bool
+		err         error
+	}
+	jobCh := make(chan git.FileEntry, len(jobs))
+	resultCh := make(chan fingerprintResult, len(jobs))
+	for _, entry := range jobs {
+		jobCh <- entry
+	}
+	close(jobCh)
+
+	workers := min(maxReviewFingerprintWorkers, len(jobs))
+	for range workers {
+		go func() {
+			for entry := range jobCh {
+				lines, err := m.fetchEffectiveFileDiff(entry, 0, true)
+				result := fingerprintResult{path: entry.Path, err: err}
+				if err == nil {
+					result.fingerprint = git.FileFingerprint(entry, lines)
+					result.stable = git.ReviewFingerprintStable(lines)
+				}
+				resultCh <- result
+			}
+		}()
+	}
+
+	warnings := make([]string, 0)
+	for range jobs {
+		result := <-resultCh
+		if result.err != nil {
+			warnings = append(warnings, fmt.Sprintf("reviewed fingerprint %s: %v", result.path, result.err))
+			continue
+		}
+		if !result.stable {
+			continue
+		}
+		current[result.path] = result.fingerprint
+	}
+	slices.Sort(warnings)
+	return current, warnings
+}
+
+// detectUntrackedRenames pairs untracked renames with their deleted origin. It is a
+// no-op (returns nil) unless a git rename detector is wired and the review is in
+// unstaged working-tree mode - the only mode where a `mv old new` leaves new untracked
+// and old deleted. The returned warning string is non-empty only when detection failed.
+func (m Model) detectUntrackedRenames(untracked []string) ([]git.FileEntry, string) {
+	if m.loadUntrackedRenames == nil || m.session.ref != "" || m.session.staged {
+		return nil, ""
+	}
+	renames, err := m.loadUntrackedRenames(untracked)
+	if err != nil {
+		return nil, fmt.Sprintf("untracked renames: %v", err)
+	}
+	return renames, ""
+}
+
+// mergeUntrackedEntries folds untracked files and detected untracked renames into the
+// tracked-change entries. Each rename replaces the standalone deletion of its origin
+// with a single rename entry. the remaining untracked paths are appended as additions,
+// skipping any already present (including rename new-sides) to avoid duplicates.
+func (m Model) mergeUntrackedEntries(entries []git.FileEntry, untracked []string, renames []git.FileEntry) []git.FileEntry {
+	renameOld := make(map[string]bool, len(renames))
+	for _, r := range renames {
+		renameOld[r.OldPath] = true
+	}
+
+	// drop standalone deletions that are actually rename origins, then add the renames
+	if len(renameOld) > 0 {
+		kept := make([]git.FileEntry, 0, len(entries))
+		for _, e := range entries {
+			if e.Status == git.FileDeleted && renameOld[e.Path] {
+				continue
+			}
+			kept = append(kept, e)
+		}
+		entries = kept
+	}
+	entries = append(entries, renames...)
+
+	// rename new-sides are already in entries (appended above), so entrySet covers
+	// them - any untracked path equal to a rename new-side is skipped here too.
+	entrySet := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		entrySet[e.Path] = true
+	}
+	for _, f := range untracked {
+		if !entrySet[f] {
+			entries = append(entries, git.FileEntry{Path: f, Status: git.FileUntracked})
+		}
+	}
+	return entries
+}
+
+// loadCommits returns a command that fetches the commit log for the current ref range.
+// returns nil when the feature is not applicable or no source is configured, so callers
+// can unconditionally include it in tea.Batch alongside loadFiles.
+// the caller must bump m.commits.loadSeq before invoking loadCommits when issuing a new
+// reload (e.g. triggerReload). the captured seq tags every emitted commitsLoadedMsg
+// so handleCommitsLoaded can drop stale results from earlier in-flight loads.
+func (m Model) loadCommits() tea.Cmd {
+	if !m.commits.applicable || m.commits.source == nil {
+		return nil
+	}
+	seq := m.commits.loadSeq
+	ref := m.session.ref
+	src := m.commits.source
+	return func() tea.Msg {
+		list, err := src.CommitLog(ref)
+		return commitsLoadedMsg{
+			seq:       seq,
+			list:      list,
+			err:       err,
+			truncated: len(list) >= git.MaxCommits,
+		}
+	}
+}
+
+// loadFileDiff returns a command that fetches the diff lines for the given file.
+func (m Model) loadFileDiff(file string) tea.Cmd {
+	seq := m.file.loadSeq
+	contextLines := m.currentContextLines()
+	entry := git.FileEntry{Path: file, OldPath: m.tree.OldPath(file), Status: m.tree.FileStatus(file)}
+	return func() tea.Msg {
+		lines, err := m.fetchEffectiveFileDiff(entry, contextLines, false)
+		return fileLoadedMsg{file: file, oldName: entry.OldPath, seq: seq, lines: lines, err: err}
+	}
+}
+
+// requestFileDiff records the selected target, advances the load sequence, and
+// returns a command for that exact request.
+func (m *Model) requestFileDiff(file string) tea.Cmd {
+	m.file.requestedPath = file
+	m.file.loadSeq++
+	return m.loadFileDiff(file)
+}
+
+// fetchEffectiveFileDiff applies the same staged-only and untracked fallbacks
+// used by the visible diff. Fingerprints call this helper too, so review state
+// is always based on the content igit would actually display.
+func (m Model) fetchEffectiveFileDiff(entry git.FileEntry, contextLines int, strict bool) ([]git.DiffLine, error) {
+	req := git.FileDiffRequest{
+		Ref:          m.session.ref,
+		Path:         entry.Path,
+		OldPath:      entry.OldPath,
+		Staged:       m.session.staged,
+		ContextLines: contextLines,
+	}
+	lines, err := m.diffSource.FileDiff(req)
+	if err != nil {
+		return lines, fmt.Errorf("load effective diff %s: %w", entry.Path, err)
+	}
+	if len(lines) > 0 {
+		return lines, nil
+	}
+
+	if !m.session.staged && entry.Status == git.FileAdded {
+		req.Staged = true
+		cachedLines, cachedErr := m.diffSource.FileDiff(req)
+		if cachedErr != nil {
+			return cachedLines, fmt.Errorf("load staged effective diff %s: %w", entry.Path, cachedErr)
+		}
+		if len(cachedLines) > 0 {
+			return cachedLines, nil
+		}
+	}
+	if m.session.workDir != "" && entry.Status == git.FileUntracked {
+		added, readErr := git.ReadFileAsAdded(filepath.Join(m.session.workDir, entry.Path))
+		if readErr != nil && !strict {
+			log.Printf("[WARN] read untracked file %s: %v", entry.Path, readErr)
+			return nil, nil
+		}
+		if readErr != nil {
+			return added, fmt.Errorf("read untracked file %s: %w", entry.Path, readErr)
+		}
+		return added, nil
+	}
+	return lines, nil
+}
+
+// loadReviewFingerprint fetches a semantic identity for a tree selection that
+// was marked before its normal visible diff load completed.
+func (m Model) loadReviewFingerprint(entry git.FileEntry, seq uint64) tea.Cmd {
+	filesSeq := m.filesLoadSeq
+	return func() tea.Msg {
+		lines, err := m.fetchEffectiveFileDiff(entry, 0, true)
+		msg := reviewFingerprintLoadedMsg{path: entry.Path, seq: seq, filesSeq: filesSeq, err: err}
+		if err == nil {
+			msg.fingerprint = git.FileFingerprint(entry, lines)
+		}
+		return msg
+	}
+}
+
+// currentContextLines returns the context-lines count to pass to FileDiff based
+// on the current compact mode state. returns compactContext when compact mode
+// is enabled and the feature is applicable to this source, otherwise 0, which
+// the renderers treat as "full-file context" (the igit default).
+func (m Model) currentContextLines() int {
+	if m.modes.compact && m.compact.applicable {
+		return m.modes.compactContext
+	}
+	return 0
+}
+
+// reloadCurrentFile re-fetches the diff for the currently displayed file and
+// invalidates any in-flight load for it via a loadSeq bump. Used by the compact
+// toggle to pick up the new context size without re-fetching the full file list
+// or commit log (unlike triggerReload). Returns nil when no file is loaded.
+func (m *Model) reloadCurrentFile() tea.Cmd {
+	if m.file.name == "" {
+		return nil
+	}
+	return m.requestFileDiff(m.file.name)
+}
+
+// captureCompactAnchor records the cursor's semantic position before a compact
+// toggle so applyCompactAnchor can restore the view after the re-fetch at the
+// new context size. Returns nil when no file is loaded or the cursor is unset,
+// in which case the toggle falls back to the default top positioning.
+func (m Model) captureCompactAnchor() *compactAnchor {
+	if m.file.name == "" || m.nav.diffCursor < 0 || m.nav.diffCursor >= len(m.file.lines) {
+		return nil
+	}
+	dl := m.file.lines[m.nav.diffCursor]
+	return &compactAnchor{
+		srcLine:    m.diffLineNum(dl),
+		changeType: dl.ChangeType,
+		hunkIdx:    m.nearestHunkIndex(m.nav.diffCursor),
+	}
+}
+
+// applyCompactAnchor restores the cursor to the position captured before a
+// compact toggle and centers the viewport on it. It resolves the anchor by
+// source line number. when that line is absent from the re-fetched diff (a
+// context line dropped in the full->compact direction), it falls back to the
+// nearest hunk captured at toggle time, then to the first visible line. In
+// collapsed mode adjustCursorIfHidden nudges the cursor off a hidden removed
+// line (e.g. a modify hunk's start) so it never lands out of sight.
+func (m *Model) applyCompactAnchor(a *compactAnchor) {
+	m.nav.onAnnotationRow = false
+	if a.srcLine > 0 && a.changeType != git.ChangeDivider {
+		if idx := m.findDiffLineIndex(a.srcLine, string(a.changeType)); idx >= 0 {
+			m.nav.diffCursor = idx
+			m.adjustCursorIfHidden()
+			m.centerViewportOnCursor()
+			return
+		}
+	}
+	if hunks := m.findHunks(); a.hunkIdx >= 0 && a.hunkIdx < len(hunks) {
+		m.nav.diffCursor = hunks[a.hunkIdx]
+		m.adjustCursorIfHidden()
+		m.centerViewportOnCursor()
+		return
+	}
+	m.skipInitialDividers()
+	m.centerViewportOnCursor()
+}
+
+// loadBlame returns a command that fetches blame data for the given file.
+// returns nil if no blamer is configured.
+func (m Model) loadBlame(file string) tea.Cmd {
+	if m.blamer == nil {
+		return nil
+	}
+	seq := m.file.loadSeq
+	ref := m.session.ref
+	staged := m.session.staged
+	return func() tea.Msg {
+		data, err := m.blamer.FileBlame(ref, file, staged)
+		return blameLoadedMsg{file: file, seq: seq, data: data, err: err}
+	}
+}
+
+// loadSelectedIfChanged ensures the tree is visible and loads the selected file if it changed.
+func (m Model) loadSelectedIfChanged() (tea.Model, tea.Cmd) {
+	m.tree.EnsureVisible(m.treePageSize())
+	if f := m.tree.SelectedFile(); f != "" {
+		if f != m.file.name {
+			cmd := m.requestFileDiff(f)
+			return m, cmd
+		}
+		if m.file.requestedPath != "" && m.file.requestedPath != f {
+			m.file.canceledLoadSeq = m.file.loadSeq
+			m.file.canceledLoadPath = m.file.requestedPath
+			m.file.requestedPath = ""
+		}
+	}
+	return m, nil
+}
+
+// triggerReload triggers a full reload of the file list, current file diff,
+// and commit log. It bumps filesLoadSeq and commits.loadSeq to invalidate any
+// in-flight loads, clears the commit cache and review-stats cache so the
+// overlay shows loading state (not stale data) while the re-fetch is in
+// flight, then re-runs the same parallel pipeline as startup via tea.Batch.
+// The selected file in the tree is restored by SelectByPath in
+// handleFilesLoaded. the diff cursor resets to the top of the file, or to its
+// first change when start-at-change is enabled. Named
+// triggerReload (not reload) to avoid shadowing the Model.reload field.
+func (m *Model) triggerReload() tea.Cmd {
+	m.filesLoadSeq++
+	m.file.loadSeq++ // invalidate in-flight fileLoadedMsg from pre-reload selection
+	m.commits.loadSeq++
+	m.commits.loaded = false
+	m.commits.list = nil
+	m.filesLoaded = false
+	m.review.adds = 0
+	m.review.removes = 0
+	m.review.partial = false
+	m.review.statsLoaded = false
+	m.review.statsRequested = false
+	m.review.statsLoadSeq++ // invalidate any in-flight stats fetch
+	m.reviewed.loadSeq++
+	m.reviewed.cache = make(map[string]string)
+	m.reviewed.pending = make(map[string]uint64)
+	return tea.Batch(m.loadFiles(), m.loadCommits())
+}
+
+// handleFilesLoaded processes the result of loadFiles, populating the file tree
+// and triggering the initial file diff load.
+func (m Model) handleFilesLoaded(msg filesLoadedMsg) (tea.Model, tea.Cmd) {
+	// drop stale responses from an earlier load. only the latest load request
+	// (matching m.filesLoadSeq) is accepted. Prevents an older in-flight load from
+	// overwriting the tree after toggleUntracked (or a rapid double-toggle).
+	if msg.seq != m.filesLoadSeq {
+		return m, nil
+	}
+	m.filesLoaded = true
+	if msg.err != nil {
+		m.layout.viewport.SetContent(fmt.Sprintf("error loading files: %v", msg.err))
+		return m, nil
+	}
+	for _, w := range msg.warnings {
+		log.Printf("[WARN] %s", w)
+	}
+	entries := m.filterOnly(msg.entries)
+	statsPending := m.review.statsRequested && !m.review.statsLoaded
+	m.setReviewEntries(entries)
+	var statsCmd tea.Cmd
+	if statsPending {
+		statsCmd = m.triggerReviewStats()
+	}
+	m.refreshInfoOverlay()
+	if len(entries) == 0 && len(m.session.only) > 0 {
+		m.layout.viewport.SetContent("no files match --only filter")
+		return m, statsCmd
+	}
+	// Pending marks were started against the previous tree. Keep requests for
+	// surviving paths, but cancel removed ones so a late fingerprint cannot
+	// reintroduce an invisible reviewed entry.
+	present := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		present[entry.Path] = struct{}{}
+	}
+	for path := range m.reviewed.pending {
+		if _, ok := present[path]; !ok {
+			delete(m.reviewed.pending, path)
+		}
+	}
+	m.tree.Rebuild(entries)
+	m.tree.ReconcileReviewed(msg.reviewedBefore, msg.reviewedFingerprints)
+	m.reviewed.cache = make(map[string]string, len(msg.reviewedFingerprints))
+	maps.Copy(m.reviewed.cache, msg.reviewedFingerprints)
+	if m.tree.FilterActive() {
+		m.tree.RefreshFilter(m.annotatedFiles())
+	}
+	if m.tree.UnreviewedFilterActive() {
+		m.tree.RefreshUnreviewedFilter()
+	}
+	if m.file.name != "" {
+		m.tree.SelectByPath(m.file.name)
+	}
+	m.file.singleFile = m.tree.TotalFiles() == 1
+	if len(entries) == 0 {
+		m.file.name = ""
+		m.file.oldName = ""
+		m.file.lines = nil
+		m.remoteByKey = nil
+		m.file.highlighted = nil
+		m.file.lineWidths = nil
+		m.layout.viewport.SetContent("")
+		return m, statsCmd
+	}
+	if m.file.singleFile {
+		m.layout.focus = paneDiff
+	}
+	if m.ready {
+		m.layout.viewport.Width = m.applyTreeWidth()
+	}
+
+	// auto-select first file
+	if f := m.tree.SelectedFile(); f != "" {
+		return m, tea.Batch(m.requestFileDiff(f), statsCmd)
+	}
+	return m, statsCmd
+}
+
+// handleCommitsLoaded processes the result of loadCommits, populating the
+// cached commit log on the model. Drops stale results from earlier in-flight
+// loads (triggered by R reload) via the seq tag, mirroring handleFilesLoaded.
+// An error is cached the same way as success: loaded is set to true so the
+// overlay shows the error once instead of re-triggering the fetch.
+//
+// When the info popup is already open, refreshes its spec so the
+// "loading commits..." placeholder flips to the rendered list inline. the
+// popup's scroll offset is preserved across the refresh.
+func (m Model) handleCommitsLoaded(msg commitsLoadedMsg) (tea.Model, tea.Cmd) {
+	if msg.seq != m.commits.loadSeq {
+		return m, nil
+	}
+	m.commits.list = msg.list
+	m.commits.err = msg.err
+	m.commits.truncated = msg.truncated
+	m.commits.loaded = true
+	m.refreshInfoOverlay()
+	return m, nil
+}
+
+func (m Model) handleFileLoaded(msg fileLoadedMsg) (tea.Model, tea.Cmd) {
+	// discard stale responses. only the latest load request (by sequence) is accepted
+	if msg.seq != m.file.loadSeq {
+		return m, nil
+	}
+	// sequence equality alone is not enough when navigation returns to the
+	// already displayed file without issuing another load. Reject the exact
+	// outstanding request canceled by that no-load selection.
+	if msg.seq == m.file.canceledLoadSeq && msg.file == m.file.canceledLoadPath {
+		return m, nil
+	}
+	m.file.requestedPath = ""
+	if msg.err != nil {
+		m.layout.viewport.SetContent(fmt.Sprintf("error loading diff: %v", msg.err))
+		return m, nil
+	}
+	m.file.name = msg.file
+	m.file.oldName = msg.oldName
+	m.file.lines = msg.lines
+	m.remoteByKey = m.indexRemoteNotes()
+	entry := git.FileEntry{Path: msg.file, OldPath: m.tree.OldPath(msg.file), Status: m.tree.FileStatus(msg.file)}
+	fingerprint := git.FileFingerprint(entry, m.file.lines)
+	m.reviewed.cache[msg.file] = fingerprint
+	m.tree.ReconcileReviewedPath(msg.file, fingerprint)
+	m.invalidateRenderCaches()
+	m.clearSearch()
+	m.computeFileStats()
+	m.file.highlighted = m.highlighter.HighlightLines(msg.file, m.file.lines)
+	m.recomputeIntraRanges()
+	m.file.lineWidths = m.computeLineWidths()
+	if m.modes.lineNumbers {
+		m.file.lineNumWidth = m.computeLineNumWidth()
+	}
+	m.nav.onAnnotationRow = false
+	m.layout.scrollX = 0
+	m.modes.collapsed.expandedHunks = make(map[int]bool)
+
+	m.file.singleColLineNum = m.isFullContext(msg.lines)
+
+	if m.ready {
+		m.layout.viewport.Width = m.applyTreeWidth()
+	}
+
+	m.skipInitialDividers()
+
+	// clear stale blame data. reload if blame is active
+	var blameCmd tea.Cmd
+	if m.modes.showBlame {
+		m.file.blameData = nil
+		m.file.blameAuthorLen = 0
+		blameCmd = m.loadBlame(msg.file)
+	}
+
+	// handle pending annotation list jump
+	if m.pendingAnnotJump != nil && m.pendingAnnotJump.File == msg.file {
+		a := *m.pendingAnnotJump
+		m.pendingAnnotJump = nil
+		m.nav.pendingHunkJump = nil
+		m.positionOnAnnotation(a)
+		return m, blameCmd
+	}
+
+	// handle pending hunk jump after cross-file hunk navigation
+	if m.nav.pendingHunkJump != nil {
+		m.applyPendingHunkJump()
+		m.centerViewportOnCursor()
+		return m, blameCmd
+	}
+
+	// handle pending compact-toggle anchor: restore the cursor to where it was
+	// before the toggle instead of resetting to the top. seq ties the anchor to
+	// this exact reload, so a stale anchor from a superseded load is dropped.
+	if m.compact.pendingAnchor != nil {
+		a := m.compact.pendingAnchor
+		m.compact.pendingAnchor = nil
+		if a.seq == msg.seq {
+			m.applyCompactAnchor(a)
+			return m, blameCmd
+		}
+	}
+
+	// sits below the three jump branches so an explicit jump target always wins, and must return
+	// early because the GotoTop below would undo the scroll.
+	if m.session.startAtChange {
+		m.positionOnFirstChange()
+		m.centerViewportOnCursor()
+		return m, blameCmd
+	}
+
+	m.layout.viewport.SetContent(m.renderDiff())
+	m.layout.viewport.GotoTop()
+	return m, blameCmd
+}
+
+func (m Model) handleReviewFingerprintLoaded(msg reviewFingerprintLoadedMsg) (tea.Model, tea.Cmd) {
+	seq, pending := m.reviewed.pending[msg.path]
+	if !pending || seq != msg.seq {
+		return m, nil
+	}
+	delete(m.reviewed.pending, msg.path)
+	if msg.filesSeq != m.filesLoadSeq {
+		return m, nil
+	}
+	if msg.err != nil {
+		log.Printf("[WARN] fingerprint reviewed file %s: %v", msg.path, msg.err)
+		return m, nil
+	}
+	m.reviewed.cache[msg.path] = msg.fingerprint
+	m.tree.SetReviewed(msg.path, msg.fingerprint)
+	return m.loadSelectedIfChanged()
+}
+
+// handleBlameLoaded processes asynchronously loaded blame data for a file.
+func (m Model) handleBlameLoaded(msg blameLoadedMsg) (tea.Model, tea.Cmd) {
+	if msg.seq != m.file.loadSeq || msg.file != m.file.name || !m.modes.showBlame {
+		return m, nil
+	}
+	if msg.err != nil {
+		// blame unavailable for this file (e.g. new untracked file). silently ignore
+		return m, nil
+	}
+	m.file.blameData = msg.data
+	m.file.blameAuthorLen = m.computeBlameAuthorLen()
+	// blameData is not part of globalRenderKey (a map is not comparable), so cached
+	// blocks rendered without blame would otherwise survive the gutter appearing
+	m.invalidateRenderCaches()
+	// flush deferred wheel pin before syncViewportToCursor so the post-blame
+	// scroll is anchored to the user's wheeled-to position rather than the
+	// pre-burst cursor. mirrors the handleResize flush rationale.
+	m.flushWheelPending()
+	m.syncViewportToCursor()
+	return m, nil
+}
+
+// maxBlameAuthor is the maximum display width for author names in the blame gutter.
+const maxBlameAuthor = 8
+
+// computeBlameAuthorLen returns the display width of the longest author name in blame data.
+// caps at maxBlameAuthor characters to keep the gutter compact.
+func (m Model) computeBlameAuthorLen() int {
+	maxLen := 0
+	for _, bl := range m.file.blameData {
+		if l := runewidth.StringWidth(bl.Author); l > maxLen {
+			maxLen = l
+		}
+	}
+	if maxLen > maxBlameAuthor {
+		maxLen = maxBlameAuthor
+	}
+	if maxLen == 0 {
+		maxLen = 1
+	}
+	return maxLen
+}
+
+// filterOnly returns only files matching the --only patterns, or all files if no filter is set.
+// matches by exact path or path suffix (e.g. "model.go" matches "ui/model.go").
+// when workDir is set, both entries and patterns are also normalized to workDir-relative
+// form for matching, so "./CLAUDE.md" matches "CLAUDE.md" and an absolute entry from
+// FileReader ("/repo/CLAUDE.md") matches a relative pattern ("CLAUDE.md").
+func (m Model) filterOnly(entries []git.FileEntry) []git.FileEntry {
+	if len(m.session.only) == 0 {
+		return entries
+	}
+	var filtered []git.FileEntry
+	for _, e := range entries {
+		for _, pattern := range m.session.only {
+			if m.entryMatchesOnly(e.Path, pattern) {
+				filtered = append(filtered, e)
+				break
+			}
+		}
+	}
+	return filtered
+}
+
+// entryMatchesOnly reports whether a file entry matches a single --only pattern.
+// checks exact match, suffix match, and workDir-normalized equality/suffix.
+// normalization handles "./" prefixes, absolute patterns, and absolute entries uniformly.
+func (m Model) entryMatchesOnly(entry, pattern string) bool {
+	if entry == pattern || strings.HasSuffix(entry, "/"+pattern) {
+		return true
+	}
+	if m.session.workDir == "" {
+		return false
+	}
+	entryRel := m.workDirRel(entry)
+	patternRel := m.workDirRel(pattern)
+	if entryRel == "" || patternRel == "" {
+		return false
+	}
+	return entryRel == patternRel || strings.HasSuffix(entryRel, "/"+patternRel)
+}
+
+// workDirRel returns path as workDir-relative, or "" if path escapes workDir.
+// relative input is joined with workDir first. absolute input is used as-is.
+func (m Model) workDirRel(path string) string {
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(m.session.workDir, path)
+	}
+	rel, err := filepath.Rel(m.session.workDir, path)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	return rel
+}
+
+// computeFileStats counts added and removed lines in the current file.
+func (m *Model) computeFileStats() {
+	m.file.adds, m.file.removes = git.CountChanges(m.file.lines)
+}
+
+// fileStatsText returns the stats segment for the status bar.
+// shows total line count for context-only files, or +adds/-removes for diffs.
+func (m Model) fileStatsText() string {
+	if m.file.adds == 0 && m.file.removes == 0 && len(m.file.lines) > 0 {
+		return fmt.Sprintf("%d lines", len(m.file.lines))
+	}
+	return fmt.Sprintf("+%d/-%d", m.file.adds, m.file.removes)
+}
+
+// skipInitialDividers positions diffCursor on the first visible line.
+// skips divider lines, and in collapsed mode also skips removed lines
+// unless their hunk is expanded.
+func (m *Model) skipInitialDividers() {
+	m.nav.diffCursor = 0
+	hunks := m.findHunks()
+	for i, dl := range m.file.lines {
+		if dl.ChangeType == git.ChangeDivider || m.isCollapsedHidden(i, hunks) {
+			continue
+		}
+		m.nav.diffCursor = i
+		return
+	}
+}
+
+// isFullContext returns true when every non-divider line is ChangeContext.
+func (m Model) isFullContext(lines []git.DiffLine) bool {
+	hasContext := false
+	for _, line := range lines {
+		if line.ChangeType == git.ChangeDivider {
+			continue
+		}
+		if line.ChangeType != git.ChangeContext {
+			return false
+		}
+		hasContext = true
+	}
+	return hasContext
+}
+
+// recomputeIntraRanges walks m.file.lines, finds contiguous change blocks,
+// pairs remove/add lines, runs word-diff, and stores results in m.file.intraRanges.
+// no-op when m.modes.wordDiff is off: clears m.file.intraRanges to nil so callers don't
+// need to duplicate the guard at each call site.
+func (m *Model) recomputeIntraRanges() {
+	if !m.modes.wordDiff {
+		m.file.intraRanges = nil
+		return
+	}
+	n := len(m.file.lines)
+	m.file.intraRanges = make([][]worddiff.Range, n)
+
+	i := 0
+	for i < n {
+		if m.file.lines[i].ChangeType != git.ChangeAdd && m.file.lines[i].ChangeType != git.ChangeRemove {
+			i++
+			continue
+		}
+		blockStart := i
+		for i < n && (m.file.lines[i].ChangeType == git.ChangeAdd || m.file.lines[i].ChangeType == git.ChangeRemove) {
+			i++
+		}
+
+		// build LinePair slice for the block
+		block := make([]worddiff.LinePair, i-blockStart)
+		for j := blockStart; j < i; j++ {
+			block[j-blockStart] = worddiff.LinePair{
+				Content:  strings.ReplaceAll(m.file.lines[j].Content, "\t", m.cfg.tabSpaces),
+				IsRemove: m.file.lines[j].ChangeType == git.ChangeRemove,
+			}
+		}
+
+		pairs := m.differ.PairLines(block)
+		for _, p := range pairs {
+			minusRanges, plusRanges := m.differ.ComputeIntraRanges(block[p.RemoveIdx].Content, block[p.AddIdx].Content)
+			m.file.intraRanges[blockStart+p.RemoveIdx] = minusRanges
+			m.file.intraRanges[blockStart+p.AddIdx] = plusRanges
+		}
+	}
+}

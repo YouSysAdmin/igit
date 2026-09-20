@@ -1,0 +1,183 @@
+[Application Options]
+; start in review or commit mode
+; mode = review
+
+; code host of the pull or merge request (default: from the origin remote)
+; forge =
+
+; include only files matching prefix (may be repeated)
+; include =
+
+; exclude files matching prefix (may be repeated)
+; exclude =
+
+; load theme from themes directory
+; theme =
+
+; theme to use for dark terminal backgrounds when --theme=auto
+; auto-theme-dark = default
+
+; theme to use for light terminal backgrounds when --theme=auto
+; auto-theme-light = basic
+
+; chroma style for syntax highlighting
+; chroma-style = catppuccin-macchiato
+
+[Display Options]
+; side pane width in tenths of the window, 1-10 (default 2 in review mode, 3 in commit mode)
+; tree-width = 0
+
+; number of spaces per tab character
+; tab-width = 4
+
+; disable all colors including syntax highlighting
+; no-colors = false
+
+; hide the status bar
+; no-status-bar = false
+
+; disable mouse support (scroll wheel, click)
+; no-mouse = false
+
+; hide the file tree pane
+; no-tree = false
+
+; enable line wrapping in diff view
+; wrap = false
+
+; indent wrap continuation rows by N columns so they hang under the first row's content (helps when reviewing markdown lists where unindented continuation can be misread as a new bullet)
+; wrap-indent = 0
+
+; keep N lines from the previous screen when paging the diff
+; page-overlap = 0
+
+; allow [ and ] to jump across file boundaries
+; cross-file-hunks = false
+
+; position the cursor on the first changed line
+; start-at-change = false
+
+; show line numbers in diff gutter
+; line-numbers = false
+
+; highlight intra-line word-level changes in paired add/remove lines
+; word-diff = false
+
+[Review Options]
+; show staged changes
+; staged = false
+
+; start with untracked files hidden (u toggles them back)
+; tracked-only = false
+
+; start in collapsed diff mode
+; collapsed = false
+
+; start in compact diff mode (small context around changes)
+; compact = false
+
+; number of context lines around changes when in compact mode
+; compact-context = 5
+
+; show blame gutter
+; blame = false
+
+; prefix shown before annotation lines
+; annotation-marker = 💬
+
+; skip confirmation prompt when discarding annotations with Q
+; no-confirm-discard-annotations = false
+
+; skip confirmation prompt when dropping annotations on reload with R
+; no-confirm-reload = false
+
+; directory for timestamped annotation files written on exit
+; output-dir =
+
+; directory for review history auto-saves
+; history-dir =
+
+; keep at most N saved reviews per repository, one per working tree, ref range or pull request (0 disables the history)
+; history-max = 20
+
+[Commit Options]
+; skip pre-commit and commit-msg hooks when committing
+; no-verify = false
+
+; files shown in the combined diff of the highlighted Log or Stash entry, enter
+; opens the full list (0 shows every file, which is slow on large commits)
+; log-diff-files = 10
+
+; add a Signed-off-by trailer to commits
+; signoff = false
+
+[Color Options]
+; active pane borders and directory names
+; color-accent = #D5895F
+
+; inactive pane borders
+; color-border = #585858
+
+; file entries and context lines
+; color-normal = #d0d0d0
+
+; line numbers and status bar
+; color-muted = #585858
+
+; selected file text color
+; color-selected-fg = #ffffaf
+
+; selected file background color
+; color-selected-bg = #D5895F
+
+; annotation text and markers
+; color-annotation = #ffd700
+
+; diff cursor indicator color
+; color-cursor-fg = #bbbb44
+
+; diff cursor indicator background
+; color-cursor-bg =
+
+; added line text color
+; color-add-fg = #87d787
+
+; added line background color
+; color-add-bg = #123800
+
+; removed line text color
+; color-remove-fg = #ff8787
+
+; removed line background color
+; color-remove-bg = #4D1100
+
+; intra-line word-diff add background (auto-derived if empty)
+; color-word-add-bg =
+
+; intra-line word-diff remove background (auto-derived if empty)
+; color-word-remove-bg =
+
+; modified line text color (collapsed mode)
+; color-modify-fg = #f5c542
+
+; modified line background color (collapsed mode)
+; color-modify-bg = #3D2E00
+
+; file tree pane background
+; color-tree-bg =
+
+; diff pane background
+; color-diff-bg =
+
+; status bar foreground
+; color-status-fg = #202020
+
+; status bar background
+; color-status-bg = #C5794F
+
+; search match foreground
+; color-search-fg = #1a1a1a
+
+; search match background
+; color-search-bg = #4a4a00
+

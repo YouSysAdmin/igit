@@ -1,0 +1,1520 @@
+package tui
+
+//go:generate moq -out mocks/diff_source.go -pkg mocks -skip-ensure -fmt goimports . DiffSource
+//go:generate moq -out mocks/syntax_highlighter.go -pkg mocks -skip-ensure -fmt goimports . SyntaxHighlighter
+//go:generate moq -out mocks/blamer.go -pkg mocks -skip-ensure -fmt goimports . Blamer
+//go:generate moq -out mocks/style_resolver.go -pkg mocks -skip-ensure -fmt goimports . styleResolver
+//go:generate moq -out mocks/style_renderer.go -pkg mocks -skip-ensure -fmt goimports . styleRenderer
+//go:generate moq -out mocks/sgr_processor.go -pkg mocks -skip-ensure -fmt goimports . sgrProcessor
+//go:generate moq -out mocks/word_differ.go -pkg mocks -skip-ensure -fmt goimports . wordDiffer
+//go:generate moq -out mocks/external_editor.go -pkg mocks -skip-ensure -fmt goimports . ExternalEditor
+//go:generate moq -out mocks/commit_log_source.go -pkg mocks -skip-ensure -fmt goimports . commitLogSource
+
+// note: ThemeCatalog is not moq-generated because ThemeEntry/ThemeSpec are defined in this package,
+// creating an import cycle (ui -> mocks -> ui). Tests use manual fakes instead.
+
+import (
+	"fmt"
+	"reflect"
+	"strconv"
+	"strings"
+
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/yousysadmin/igit/internal/annot"
+	"github.com/yousysadmin/igit/internal/extcmd"
+	"github.com/yousysadmin/igit/internal/git"
+	"github.com/yousysadmin/igit/internal/keymap"
+	"github.com/yousysadmin/igit/internal/stageplan"
+	"github.com/yousysadmin/igit/internal/tui/overlay"
+	"github.com/yousysadmin/igit/internal/tui/sidepane"
+	"github.com/yousysadmin/igit/internal/tui/style"
+	"github.com/yousysadmin/igit/internal/tui/worddiff"
+)
+
+// DiffSource provides methods to extract changed files and build diff views.
+// contextLines controls surrounding context on FileDiff: 0 or >= 1000000 requests
+// full-file context (the igit default). positive values < 1000000 request that
+// many lines on each side of a hunk. Context-only sources ignore this parameter.
+type DiffSource interface {
+	ChangedFiles(ref string, staged bool) ([]git.FileEntry, error)
+	FileDiff(req git.FileDiffRequest) ([]git.DiffLine, error)
+}
+
+// SyntaxHighlighter provides syntax highlighting for diff lines.
+type SyntaxHighlighter interface {
+	HighlightLines(filename string, lines []git.DiffLine) []string
+	SetStyle(styleName string) bool
+	StyleName() string
+}
+
+// Blamer provides blame information for files.
+type Blamer interface {
+	FileBlame(ref, file string, staged bool) (map[int]git.BlameLine, error)
+}
+
+// styleResolver is what Model needs for static and runtime style/color lookups.
+// Implemented by style.Resolver.
+type styleResolver interface {
+	Color(k style.ColorKey) style.Color
+	Style(k style.StyleKey) lipgloss.Style
+	LineBg(change git.ChangeType) style.Color
+	LineFg(change git.ChangeType) style.Color
+	LineStyle(change git.ChangeType, highlighted bool) lipgloss.Style
+	WordDiffBg(change git.ChangeType) style.Color
+	IndicatorBg(change git.ChangeType) style.Color
+}
+
+// styleRenderer is what Model needs for compound ANSI rendering operations.
+// Implemented by style.Renderer.
+type styleRenderer interface {
+	AnnotationInline(text string) string
+	DiffCursor(noColors bool) string
+	SelectionMark(noColors bool) string
+	StageMark(noColors bool) string
+	FileStageMark() string
+	StatusBarSeparator() string
+	FileStatusMark(status git.ChangeStatus) string
+	FileReviewedMark() string
+	FileAnnotationMark() string
+}
+
+// sgrProcessor is what Model needs for ANSI SGR stream processing.
+// Implemented by style.SGR.
+type sgrProcessor interface {
+	Reemit(lines []string) []string
+}
+
+// wordDiffer is what Model needs for intra-line word-diff and highlight insertion.
+// Implemented by *worddiff.Differ.
+type wordDiffer interface {
+	ComputeIntraRanges(minusLine, plusLine string) ([]worddiff.Range, []worddiff.Range)
+	PairLines(lines []worddiff.LinePair) []worddiff.Pair
+	InsertHighlightMarkers(s string, matches []worddiff.Range, hlOn, hlOff string) string
+}
+
+// overlayManager is what Model needs for overlay popup coordination.
+// Implemented by *overlay.Manager.
+type overlayManager interface {
+	Active() bool
+	Kind() overlay.Kind
+	OpenHelp(spec overlay.HelpSpec)
+	OpenAnnotList(spec overlay.AnnotListSpec)
+	OpenThemeSelect(spec overlay.ThemeSelectSpec)
+	OpenFilePicker(spec overlay.FilePickerSpec)
+	OpenInfo(spec overlay.InfoSpec)
+	UpdateInfo(spec overlay.InfoSpec)
+	OpenConfirm(spec overlay.ConfirmSpec)
+	OpenMenu(spec overlay.MenuSpec)
+	OpenError(spec overlay.ErrorSpec)
+	OpenPrompt(spec overlay.PromptSpec)
+	Close()
+	HandleKey(msg tea.KeyMsg, action keymap.Action) overlay.Outcome
+	HandleMouse(msg tea.MouseMsg) overlay.Outcome
+	Compose(base string, ctx overlay.RenderCtx) string
+}
+
+// commitLogSource is what Model needs to enumerate commits in the current ref range
+// for the info popup's commit-log section. Implemented by git.Git via the
+// git.CommitLogger capability interface. nil means the section
+// is unavailable (e.g. stdin mode, FileReader, DirectoryReader, or any wrapper
+// that hides the underlying VCS). Defined on the consumer side per Go convention.
+type commitLogSource interface {
+	CommitLog(ref string) ([]git.CommitInfo, error)
+}
+
+// ThemeCatalog is what Model needs for theme discovery and persistence.
+// The UI calls Entries() to populate the theme selector overlay, Resolve() to
+// preview or apply a chosen theme, and Persist() to save the user's choice.
+// Implemented by a concrete type in internal/theme, wired through ModelConfig.
+type ThemeCatalog interface {
+	Entries() ([]ThemeEntry, error)
+	Resolve(name string) (ThemeSpec, bool)
+	Persist(name string) error
+}
+
+// ThemeEntry is minimal list-view data for one theme in the selector overlay.
+type ThemeEntry struct {
+	Name        string
+	Local       bool
+	AccentColor string
+}
+
+// ThemeSpec holds the runtime-ready representation of a theme for preview/apply.
+// UI should not import internal/theme - this struct carries everything needed to
+// rebuild style.Resolver / style.Renderer / chroma style from a theme choice.
+type ThemeSpec struct {
+	Colors      style.Colors
+	ChromaStyle string
+}
+
+// SourceEditorPolicy is the composition-root decision for opening source files
+// from the diff view.
+//
+// The UI consumes this policy instead of inferring source-editor support from
+// CLI-shaped fields such as ref, staged, or workDir.
+type SourceEditorPolicy struct {
+	// Available states whether source editing is supported in the current
+	// execution mode. It is false when the input has no stable source file
+	// target, such as --stdin.
+	Available bool
+
+	// Root resolves relative displayed paths before source-editor validation.
+	// Empty Root leaves relative paths unsupported even when source editing is
+	// otherwise available.
+	Root string
+
+	// ExactPath, when set, is the only source path opened for the current
+	// review. It bypasses displayed-path resolution while preserving line
+	// navigation from the focused diff row.
+	ExactPath string
+
+	// ReloadAfterCleanExit states whether a clean source-editor exit should
+	// reload the currently displayed diff file.
+	ReloadAfterCleanExit bool
+}
+
+// compile-time assertions - enforce that the concrete package types
+// satisfy the consumer-side interfaces.
+var (
+	_ styleResolver  = (*style.Resolver)(nil)
+	_ styleRenderer  = (*style.Renderer)(nil)
+	_ sgrProcessor   = (*style.SGR)(nil)
+	_ wordDiffer     = (*worddiff.Differ)(nil)
+	_ overlayManager = (*overlay.Manager)(nil)
+)
+
+// FileTreeComponent is what Model needs from a file-tree navigation component.
+// Implemented by *sidepane.FileTree. Exported so main.go can spell it in the
+// factory closure's return type.
+type FileTreeComponent interface {
+	// SelectedFile returns the full path of the currently selected file.
+	SelectedFile() string
+	// VisibleFiles returns visible file paths in rendered order, respecting filters.
+	VisibleFiles() []string
+	// TotalFiles returns the count of original file paths (before filtering).
+	TotalFiles() int
+	// FileStatus returns the git change status for the given file path.
+	FileStatus(path string) git.ChangeStatus
+	// OldPath returns the rename origin for the given file path, empty for non-renames.
+	OldPath(path string) string
+	// FilterActive returns true when the file tree is showing only annotated files.
+	FilterActive() bool
+	// UnreviewedFilterActive returns true when only unreviewed files are visible.
+	UnreviewedFilterActive() bool
+	// ReviewedCount returns the number of files marked as reviewed.
+	ReviewedCount() int
+	// ReviewedFingerprints returns a copy of reviewed paths and their semantic diff identities.
+	ReviewedFingerprints() map[string]string
+	// IsReviewed reports whether the given path is marked reviewed.
+	IsReviewed(path string) bool
+	// HasFile returns true if there is a file entry in the given direction.
+	HasFile(dir sidepane.Direction) bool
+	// Move navigates the cursor according to the given motion.
+	Move(m sidepane.Motion, count ...int)
+	// StepFile moves to the next or previous file entry, wrapping around at ends.
+	StepFile(dir sidepane.Direction)
+	// SelectByPath sets the cursor to the file entry matching the given path.
+	SelectByPath(path string) bool
+	// SelectByVisibleRow sets the cursor to the entry at the given visible row
+	// (0-based, relative to the first visible tree line). Returns true when the
+	// row maps to a valid entry. the cursor is unchanged when false.
+	SelectByVisibleRow(row int) bool
+	// EnsureVisible adjusts offset so the cursor is within the visible range.
+	EnsureVisible(height int)
+	// Rebuild rebuilds the file tree from new entries in-place.
+	Rebuild(entries []git.FileEntry)
+	// ToggleFilter toggles between showing all files and only annotated files.
+	ToggleFilter(annotated map[string]bool)
+	// ToggleUnreviewedFilter toggles between all files and unreviewed files.
+	ToggleUnreviewedFilter()
+	// RefreshFilter updates the filtered view with the current annotation state.
+	RefreshFilter(annotated map[string]bool)
+	// RefreshUnreviewedFilter updates the view after reviewed state changes.
+	RefreshUnreviewedFilter()
+	// SetReviewed marks a path reviewed at the supplied semantic diff identity.
+	SetReviewed(path, fingerprint string)
+	// Unreview removes the reviewed mark for a path.
+	Unreview(path string)
+	// ReconcileReviewed validates marks captured before a refreshed file-list load.
+	ReconcileReviewed(before, current map[string]string)
+	// ReconcileReviewedPath validates a reviewed mark when its refreshed diff is loaded.
+	ReconcileReviewedPath(path, currentFingerprint string)
+	// ScrollState reports the file tree's visible window after rendering.
+	ScrollState() sidepane.ScrollState
+	// Render renders the file tree into a string for display.
+	Render(r sidepane.FileTreeRender) string
+}
+
+// pane identifies which pane has focus.
+type pane int
+
+const (
+	paneTree pane = iota
+	paneDiff
+
+	minTreeWidth = 20
+)
+
+// Side pane width in tenths of the window when --tree-width is not set. The two
+// modes differ on purpose: review's tree lists file paths, commit's side pane
+// also carries staging markers and the branch, log and stash tabs, so it starts
+// wider. --tree-width overrides both.
+const (
+	defaultReviewTreeRatio = 2
+	defaultCommitSideRatio = 3
+)
+
+// loadedFileState holds all state related to the currently loaded file.
+// it groups parallel arrays (lines, highlighted, intraRanges) and derived
+// metadata (adds/removes, blame, line numbering) into a single coherent
+// object, making the synchronization invariant explicit.
+type loadedFileState struct {
+	name             string                // currently displayed file path
+	oldName          string                // rename origin of the displayed file, empty for non-renames
+	lines            []git.DiffLine        // parsed diff lines
+	highlighted      []string              // pre-computed highlighted content, parallel to lines
+	intraRanges      [][]worddiff.Range    // per-line intra-line word-diff ranges, parallel to lines
+	lineWidths       []int                 // per-line rendered display width, parallel to lines
+	adds             int                   // cached count of added lines
+	removes          int                   // cached count of removed lines
+	blameData        map[int]git.BlameLine // blame info keyed by 1-based new line number
+	blameAuthorLen   int                   // max author display width for blame gutter
+	lineNumWidth     int                   // digit width for line number columns
+	singleColLineNum bool                  // true for full-context files: one line-number column
+	loadSeq          uint64                // monotonic counter to identify the latest load request
+	requestedPath    string                // path of the outstanding request, empty after it completes
+	canceledLoadSeq  uint64                // same-sequence request canceled by returning to the displayed file
+	canceledLoadPath string                // path rejected for canceledLoadSeq
+	singleFile       bool                  // true when diff contains exactly one file
+}
+
+// modelConfigState holds immutable or near-immutable session configuration.
+// these values are set once at startup and not changed during runtime.
+type modelConfigState struct {
+	ref                string             // git ref for diff
+	staged             bool               // show staged changes
+	mergeInProgress    bool               // the tree is mid-merge, review the whole result
+	only               []string           // filter to show only matching files
+	workDir            string             // working directory for resolving absolute --only paths
+	sourceEditorPolicy SourceEditorPolicy // source-file editor availability and target behavior
+	mouseTracking      bool               // true when the session enabled mouse tracking
+	noConfirmDiscard   bool               // skip the confirmation prompt when Q discards the annotations
+	noConfirmReload    bool               // skip confirmation prompt on reload (R)
+	crossFileHunks     bool               // allow [ and ] to jump across file boundaries
+	startAtChange      bool               // put the cursor on the first changed line when a file loads
+	treeWidthRatio     int                // 1-10 units for file tree panel
+	annotPrefix        string             // cached: marker + " "
+	annotFilePrefix    string             // cached: marker + " file: "
+	outputPath         string             // --output destination for the O in-session flush, empty disables it
+}
+
+// layoutState holds viewport and layout concerns that change on resize and pane toggles.
+type layoutState struct {
+	viewport   viewport.Model // scrollable diff viewport
+	focus      pane           // which pane has focus
+	treeHidden bool           // review's file tree is toggled off, not the pane's own state
+	width      int            // terminal width
+	height     int            // terminal height
+	treeWidth  int            // review's file tree width in columns, not the pane's own state
+	scrollX    int            // horizontal scroll offset for diff pane
+}
+
+// modeState holds user-togglable view-mode flags.
+// these are display modes that the user can switch at runtime via keybindings.
+type modeState struct {
+	wrap           bool           // true when line wrapping is enabled
+	collapsed      collapsedState // collapsed diff view state
+	lineNumbers    bool           // true when line numbers are shown in gutter
+	wordDiff       bool           // true when intra-line word-diff highlighting is enabled
+	showBlame      bool           // true when blame gutter is shown
+	showUntracked  bool           // untracked files are shown in review's tree, not the pane's own state
+	compact        bool           // true when diffs are fetched with small context around changes
+	compactContext int            // number of context lines around changes when compact is enabled
+	pageOverlap    int            // rows carried over from the previous screen on page up/down, 0 disables
+}
+
+// navigationState holds cursor and navigation-adjacent state.
+type navigationState struct {
+	diffCursor      int   // index into file.lines for current cursor line
+	pendingHunkJump *bool // pending hunk jump after cross-file hunk navigation (true=first, false=last)
+	// onAnnotationRow says the cursor sits on the row drawn under the diff line
+	// rather than on the line itself. It is a cursor position, so it lives here
+	// and not with the annotation editor: what gets drawn on that row is the
+	// host's business, stepping onto it is the pane's.
+	onAnnotationRow bool
+}
+
+// searchState holds all search lifecycle state.
+type searchState struct {
+	active     bool            // true when search textinput is active (typing)
+	term       string          // last submitted search query
+	matches    []int           // indices into file.lines that match
+	cursor     int             // current position in matches (0-based)
+	input      textinput.Model // dedicated textinput for search
+	matchSet   map[int]bool    // set of file.lines indices that match, computed per render
+	history    []string        // submitted queries, oldest-first, in-memory, session-scoped
+	historyIdx int             // current recall position, len(history) means "draft" slot (no recall active)
+}
+
+// commitsState caches the commit log of the info popup, fetched at startup
+// and on reload. The popup opens on cached state and shows a loading line
+// until the first result lands. Results whose seq no longer matches loadSeq
+// are dropped.
+type commitsState struct {
+	source     commitLogSource  // VCS-backed log source, nil disables the feature
+	applicable bool             // true when current mode supports a commit list
+	loaded     bool             // true once a fetch attempt has populated the cache
+	list       []git.CommitInfo // cached commits (may be empty after a successful empty-range fetch)
+	truncated  bool             // true when the list was capped at git.MaxCommits
+	err        error            // last fetch error, surfaces in the overlay
+	loadSeq    uint64           // bumped before each new commit-log load, stale commitsLoadedMsg (seq mismatch) is dropped
+}
+
+// ReviewInfoConfig describes what the session is reviewing, for the info
+// popup. The composition root fills it in so the UI never re-derives
+// command-line semantics. A nil config disables the whole review-info part of
+// the popup (header, footer, stats, rows).
+type ReviewInfoConfig struct {
+	Label          string // header override for a named scope such as a pull request, empty derives it from the fields below
+	Standalone     bool   // the session reviews files off disk (--only outside a repository), there is no working tree or ref scope
+	WorkDir        string
+	Ref            string
+	Staged         bool
+	Only           []string
+	Include        []string
+	Exclude        []string
+	Compact        bool
+	CompactContext int
+}
+
+// reviewInfoState holds the summary of the info popup. The status histogram
+// arrives with the file list, the aggregate line counts are fetched the first
+// time the popup opens and cached until the next reload, with statsLoadSeq
+// dropping stale results. partial marks counts where a per-file read failed.
+type reviewInfoState struct {
+	cfg            *ReviewInfoConfig
+	entries        []git.FileEntry
+	statusCounts   map[git.ChangeStatus]int
+	adds           int
+	removes        int
+	statsLoaded    bool
+	statsRequested bool
+	partial        bool
+	statsLoadSeq   uint64
+	err            error
+}
+
+// reviewedState coordinates semantic identities used by mark_reviewed. cache
+// contains identities from file loads in the current file-list generation.
+// pending tracks asynchronous identity loads started when a tree selection is
+// marked before its normal diff load has completed.
+type reviewedState struct {
+	cache   map[string]string
+	pending map[string]uint64
+	loadSeq uint64
+}
+
+// reloadState holds the pending-confirmation state for the R reload feature.
+// hint is a transient status-bar message cleared on the next key press.
+// applicable is false in stdin mode (stream consumed. reload impossible).
+type reloadState struct {
+	pending    bool   // true when waiting for y/other-key confirmation
+	hint       string // transient status-bar message, cleared on next key press
+	applicable bool   // false when reload is unavailable (e.g. --stdin)
+}
+
+// compactState holds runtime state for the compact diff mode feature.
+// applicable mirrors Applicable.Compact, copied at construction so
+// the toggle handler can short-circuit without consulting CLI flags: false
+// when the underlying source is context-only (stdin, all-files, standalone
+// FileReader) and shrinking context makes no sense. hint is a transient
+// status-bar message set when the toggle fires in an unavailable mode, so
+// the key press has visible feedback. cleared on the next key press, matching
+// the reload.hint lifecycle. The user-controlled toggle state (on/off,
+// context size) lives on modeState alongside the other view toggles.
+type compactState struct {
+	applicable    bool           // true when current mode supports compact diffs
+	hint          string         // transient status-bar message, cleared on next key press
+	pendingAnchor *compactAnchor // cursor position captured before a toggle, restored after the re-fetch
+}
+
+// compactAnchor captures the cursor's semantic position before a compact-mode
+// toggle so it can be restored after the file re-fetches at the new context
+// size. Line indices differ between the compact and full diffs, so the anchor
+// resolves by source line number (srcLine + changeType). when that line is
+// absent from the re-fetched diff (a context line outside a hunk's retained
+// window in the full->compact direction), it falls back to the nearest hunk
+// captured at toggle time (hunkIdx). seq ties the anchor to the exact reload
+// the toggle issued, so an intervening file switch or reload discards it.
+type compactAnchor struct {
+	seq        uint64         // file.loadSeq of the reload this anchor belongs to
+	srcLine    int            // diffLineNum at the cursor (0 for dividers)
+	changeType git.ChangeType // change type at the cursor, for the index lookup
+	hunkIdx    int            // 0-based nearest hunk at/before cursor, -1 when none
+}
+
+// editorState holds transient feedback for opening worktree files in the
+// external editor. Annotation editor state stays on annotationState.
+type editorState struct {
+	hint string // transient status-bar message for source-editor launch outcomes
+}
+
+// keyState holds transient key-dispatch state for the leader-chord feature.
+// It lives separate from navigationState because chord state is a key-dispatch
+// concern, not a cursor/scroll concern - keeping the two split prevents
+// navigationState from growing into a grab-bag. chordPending holds the leader
+// key while waiting for the second-stage key ("" otherwise). hint is a
+// transient status-bar message ("Pending: ..." while waiting, "Unknown chord: ..."
+// on a miss) cleared on the next key press.
+type keyState struct {
+	chordPending string // leader key while waiting for the second-stage key, "" otherwise
+	hint         string // transient status-bar message, cleared on next key press
+}
+
+// annotationState holds annotation input lifecycle state.
+type annotationState struct {
+	annotating     bool           // true when annotation text input is active
+	fileAnnotating bool           // true when annotating at file level (Line=0)
+	input          textarea.Model // multi-line text editor for annotations
+	// rowCache memoizes annotationVisualRows results keyed by (prefix, body, width).
+	// invalidated by handleFileLoaded (memory hygiene - the cache is content-keyed
+	// so cross-file collisions are correct, but a fresh file has a fresh working
+	// set), applyTheme, and cancelThemeSelect (resolver styling colors baked into
+	// rows change). width changes self-invalidate via the cache key.
+	// NewModel initializes this map. direct Model{} construction is unsupported.
+	rowCache map[annotCacheKey][]string
+}
+
+// Model is the top-level bubbletea model for igit.
+type Model struct {
+	// injected dependencies
+	overlay    overlayManager
+	tree       FileTreeComponent // never nil after NewModel, starts empty, gets Rebuilt on filesLoadedMsg
+	store      *annot.Store
+	diffSource DiffSource
+	keymap     *keymap.Keymap
+	themes     ThemeCatalog   // theme catalog for discovery, resolve, and persistence
+	editor     ExternalEditor // launches $EDITOR for annotation editing and source-file opening
+	// defaultOutputPath returns the --output-dir destination for this session
+	// ("" when no directory is configured). saveAsPath returns the path the
+	// save-as prompt is prefilled with. Both are composition-root closures so
+	// time and naming stay out of the tui package.
+	defaultOutputPath func() string
+	saveAsPath        func() string
+
+	// diffPane is the state of the pane that draws the diff, embedded so every
+	// call site keeps reaching it directly. See diffpane.go for what belongs
+	// there and what stays here.
+	diffPane
+
+	// grouped state
+	session     modelConfigState        // immutable session config
+	stage       stageState              // review-mode deferred staging plan
+	pr          prState                 // pull-request review: submit-on-quit step
+	remoteNotes map[string][]RemoteNote // existing request comments by file, drawn like annotations
+	remoteByKey map[string][]RemoteNote // the loaded file's remote comments by annotation key
+	annot       annotationState         // annotation input lifecycle state
+	commits     commitsState            // eagerly loaded commit log for the info popup
+	review      reviewInfoState         // invocation summary + whole-review aggregate stats for the review-info overlay
+	reviewed    reviewedState           // semantic fingerprints for mark_reviewed
+	reload      reloadState             // pending-confirmation state and applicability for R reload
+	compact     compactState            // applicability + transient hint for compact diff mode
+	editorState editorState             // transient hint state for source-file editor launches
+	output      outputState             // transient hint state for the O in-session output flush
+	keys        keyState                // chord-pending state and transient hint for leader-chord keybindings
+
+	ready        bool   // true after first WindowSizeMsg
+	filesLoaded  bool   // true after the first filesLoadedMsg is handled (keeps the loading view pinned until real data arrives)
+	filesLoadSeq uint64 // bumped before each new file-list load, stale filesLoadedMsg (seq mismatch) is dropped
+
+	blamer               Blamer                                  // optional blame provider (nil when git unavailable)
+	loadUntracked        func() ([]string, error)                // fetches untracked files, nil when unavailable
+	loadUntrackedRenames func([]string) ([]git.FileEntry, error) // pairs untracked renames against their deleted origin, nil for non-git
+
+	discarded        bool // true when user chose to discard annotations and quit
+	inConfirmDiscard bool // true when showing discard confirmation prompt
+
+	pendingAnnotJump *annot.Annotation // pending jump target after cross-file annotation list jump
+
+	activeThemeName string               // name of currently applied theme (for cursor positioning)
+	themePreview    *themePreviewSession // non-nil while theme selector is open
+}
+
+// fileLoadedMsg is sent when a file's diff has been loaded.
+type fileLoadedMsg struct {
+	file    string
+	oldName string // rename origin of the file, empty for non-renames
+	seq     uint64
+	lines   []git.DiffLine
+	err     error
+}
+
+// reviewFingerprintLoadedMsg is sent when mark_reviewed had to fetch a file's
+// effective diff because it was not already present in the current cache.
+type reviewFingerprintLoadedMsg struct {
+	path        string
+	seq         uint64
+	filesSeq    uint64 // file-list generation in which the mark request was started
+	fingerprint string
+	err         error
+}
+
+// blameLoadedMsg is sent when blame data for a file has been loaded.
+type blameLoadedMsg struct {
+	file string
+	seq  uint64
+	data map[int]git.BlameLine
+	err  error
+}
+
+// filesLoadedMsg is sent when the changed file list is loaded.
+type filesLoadedMsg struct {
+	seq                  uint64 // matches m.filesLoadSeq at the time the load was issued, mismatched messages are dropped
+	entries              []git.FileEntry
+	reviewedBefore       map[string]string // reviewed snapshot captured when this load began
+	reviewedFingerprints map[string]string // refreshed identities for paths reviewed before this load
+	err                  error
+	warnings             []string // non-fatal issues (staged/untracked/fingerprint failures)
+}
+
+// commitsLoadedMsg is sent when the commit log for the current ref range is loaded.
+type commitsLoadedMsg struct {
+	seq       uint64 // matches m.commits.loadSeq at the time the load was issued, mismatched messages are dropped
+	list      []git.CommitInfo
+	err       error
+	truncated bool
+}
+
+// reviewStatsLoadedMsg is sent when aggregate line statistics for the current
+// review scope have been counted. seq matches review.statsLoadSeq at the time
+// the load was issued. mismatched messages are dropped (e.g. after a reload
+// invalidates the in-flight fetch). The embedded git.Stats carries
+// adds/removes/partial/err so additions to that struct flow through without
+// touching the message shape.
+type reviewStatsLoadedMsg struct {
+	seq uint64
+	git.Stats
+}
+
+// Applicable is the composition-root's verdict on the optional features, one
+// field per feature. They are computed once in main.go from the full option set
+// (stdin, staged, only, all-files, ref) and copied into Model state, because
+// modelConfigState does not carry stdin or all-files and Model has no business
+// re-deriving them from flags.
+type Applicable struct {
+	// CommitLog enables the info popup's commit-log section.
+	CommitLog bool
+	// Reload enables R: false under --stdin, where the stream is already consumed.
+	Reload bool
+	// Compact enables shrinking the diff: false under --stdin and --all-files,
+	// and for a context-only source with no changes to contextualize.
+	Compact bool
+	// StagePlan enables the review stage marks (s/S/V/c): only a git
+	// working-tree review can stage what it marks.
+	StagePlan bool
+}
+
+// ModelConfig holds all dependencies and configuration for NewModel.
+// All dependencies (DiffSource, Store, Highlighter, StyleResolver, StyleRenderer, SGR, WordDiffer, Overlay,
+// NewFileTree, Themes) are required and must be constructed by the caller.
+// Blamer, LoadUntracked, and Keymap are optional.
+type ModelConfig struct {
+	// --- UI dependencies (required, caller-constructed) ---
+	DiffSource  DiffSource        // diff source: ChangedFiles, FileDiff
+	Store       *annot.Store      // annotation store
+	Highlighter SyntaxHighlighter // syntax highlighter
+
+	// --- Style dependencies (required, caller-constructed) ---
+	StyleResolver styleResolver // color/style lookups
+	StyleRenderer styleRenderer // compound ANSI rendering
+	SGR           sgrProcessor  // SGR stream reemit
+
+	// --- Word-diff dependency (required, caller-constructed) ---
+	WordDiffer wordDiffer // intra-line diff and highlight insertion
+
+	// --- Overlay dependency (required, caller-constructed) ---
+	Overlay overlayManager // overlay popup coordinator
+
+	// --- Sidepane factories (required, wired from main.go) ---
+
+	// NewFileTree constructs a fresh FileTreeComponent from the file list.
+	// Injected by main.go (typically a closure wrapping sidepane.NewFileTree).
+	// Required - NewModel returns an error when nil.
+	NewFileTree func(entries []git.FileEntry) FileTreeComponent
+
+	// --- Theme catalog (required, wired from main.go) ---
+	Themes ThemeCatalog // theme discovery, resolve, and persistence
+
+	// --- Optional dependencies ---
+	Blamer        Blamer                   // optional blame provider (nil when git unavailable)
+	LoadUntracked func() ([]string, error) // optional untracked-files fetcher (nil when unavailable)
+	// LoadUntrackedRenames pairs untracked renames (a working-tree `mv` whose new
+	// side is still untracked) with their deleted origin so the tree shows one rename
+	// entry instead of a delete + all-add pair. Nil for non-git VCS (rename detection
+	// is git-only). only consulted in unstaged working-tree mode.
+	LoadUntrackedRenames func([]string) ([]git.FileEntry, error)
+	Keymap               *keymap.Keymap // custom key bindings (nil uses defaults)
+	Editor               ExternalEditor // external-editor driver (nil uses extcmd.Editor{})
+	// CommitLog enumerates commits in the current ref range for the info popup's
+	// commit-log section. When nil, NewModel attempts to derive the source by
+	// type-asserting the DiffSource against git.CommitLogger. if the assertion
+	// fails, the section is unavailable and the `i` popup hides it. Pass a typed-nil
+	// (e.g. var c *Foo. cfg.CommitLog = c) and the typed-nil is collapsed to
+	// nil before the type-assertion fallback runs (mirrors the Editor guard).
+	CommitLog commitLogSource
+
+	// --- Configuration values ---
+	Ref              string
+	Staged           bool
+	TreeWidthRatio   int
+	TabWidth         int      // number of spaces per tab character
+	NoColors         bool     // disable all colors including syntax highlighting
+	MouseTracking    bool     // enable mouse tracking for clicks and wheel events
+	NoStatusBar      bool     // hide the status bar
+	NoTree           bool     // hide the file tree pane
+	NoConfirmDiscard bool     // skip the confirmation prompt when Q discards the annotations
+	NoConfirmReload  bool     // skip confirmation prompt when dropping annotations on reload
+	Wrap             bool     // enable line wrapping
+	WrapIndent       int      // extra indent (cols) for wrap continuation rows, 0 disables
+	PageOverlap      int      // rows carried over from the previous screen on page up/down, 0 disables
+	Collapsed        bool     // start in collapsed diff mode
+	CrossFileHunks   bool     // allow [ and ] to jump across file boundaries
+	StartAtChange    bool     // put the cursor on the first changed line when a file loads
+	LineNumbers      bool     // show line numbers in diff gutter
+	ShowBlame        bool     // show blame gutter, requires Blamer
+	ShowUntracked    bool     // show untracked files in the tree, requires LoadUntracked
+	WordDiff         bool     // enable intra-line word-diff highlighting
+	Only             []string // show only these files (match by exact path or path suffix)
+	WorkDir          string   // working directory for resolving absolute --only paths
+	SourceEditor     SourceEditorPolicy
+	ActiveThemeName  string // name of theme currently applied (for theme selector cursor positioning)
+	// Compact is the initial value for the compact diff mode toggle. When true
+	// the UI starts with small-context diffs (CompactContext lines around each
+	// change) instead of the full-file default. Runtime-toggleable via C.
+	Compact bool
+	// CompactContext is the number of context lines requested from the VCS
+	// when compact mode is active. Zero or negative values (and values at or
+	// above the full-file sentinel) are treated as full-file context.
+	CompactContext int
+	// AnnotationMarker is the prefix shown before annotation lines.
+	// Empty is preserved so callers can intentionally render no marker.
+	AnnotationMarker string
+	// ReviewInfo populates the review-info overlay with invocation scope, filters, and
+	// aggregate file/line stats. Pass nil to preserve the legacy commit-only popup
+	// behavior used by focused tests - every derived path (footer, rows, stats
+	// trigger) treats nil as the off-switch.
+	ReviewInfo *ReviewInfoConfig
+	// OutputPath is the --output destination for the O in-session flush. Empty
+	// disables the flush (there is no file to write to). a non-empty path enables
+	// it. Copied into modelConfigState.outputPath as a plain value.
+	OutputPath string
+	// DefaultOutputPath returns the --output-dir destination for this session,
+	// or "" when no output directory is configured. Used by the O flush when
+	// --output is absent. nil is treated as always "".
+	DefaultOutputPath func() string
+	// SaveAsPath returns the path the save-as prompt (ctrl+s) is prefilled
+	// with when no output path is known yet. nil leaves the prompt empty.
+	SaveAsPath func() string
+	// MergeInProgress says the working tree is in the middle of a merge, rebase
+	// or cherry-pick. The file list then covers the whole result, staged
+	// resolutions included, instead of the unstaged changes alone.
+	MergeInProgress bool
+	// Applicable says which optional features this invocation supports.
+	Applicable Applicable
+
+	// PRReview posts annotations to the pull request under review when the
+	// session ends. nil for every other session.
+	PRReview PRReviewer
+	// RemoteNotes are the pull request's existing review comments, shown under
+	// their diff lines but never written to the output or posted.
+	RemoteNotes []RemoteNote
+}
+
+// NewModel creates a new Model from the given configuration. All dependencies
+// must be provided by the caller - there is no fallback construction.
+// Returns an error if any required dependency is missing from the config.
+// isNilValue reports whether v is a typed-nil interface value (e.g. a (*T)(nil)
+// wrapped in an interface). Used to guard interface fields where "nil means
+// default" must survive a caller passing a typed-nil pointer.
+func isNilValue(v any) bool {
+	rv := reflect.ValueOf(v)
+	k := rv.Kind()
+	if k == reflect.Pointer || k == reflect.Interface || k == reflect.Chan ||
+		k == reflect.Func || k == reflect.Map || k == reflect.Slice {
+		return rv.IsNil()
+	}
+	return false
+}
+
+// validateRequired checks every non-optional ModelConfig field is populated.
+// returns a single "<field> is required" error for the first missing dependency.
+func (cfg ModelConfig) validateRequired() error {
+	required := []struct {
+		name string
+		ok   bool
+	}{
+		{"DiffSource", cfg.DiffSource != nil},
+		{"Store", cfg.Store != nil},
+		{"Highlighter", cfg.Highlighter != nil},
+		{"StyleResolver", cfg.StyleResolver != nil},
+		{"StyleRenderer", cfg.StyleRenderer != nil},
+		{"SGR", cfg.SGR != nil},
+		{"WordDiffer", cfg.WordDiffer != nil},
+		{"Overlay", cfg.Overlay != nil},
+		{"NewFileTree", cfg.NewFileTree != nil},
+		{"Themes", cfg.Themes != nil},
+	}
+	for _, r := range required {
+		if !r.ok {
+			return fmt.Errorf("tui.NewModel: cfg.%s is required", r.name)
+		}
+	}
+	return nil
+}
+
+func NewModel(cfg ModelConfig) (Model, error) {
+	if err := cfg.validateRequired(); err != nil {
+		return Model{}, err
+	}
+	if cfg.TreeWidthRatio < 1 || cfg.TreeWidthRatio > 10 {
+		cfg.TreeWidthRatio = defaultReviewTreeRatio
+	}
+	if cfg.TabWidth < 1 {
+		cfg.TabWidth = 4
+	}
+	km := cfg.Keymap
+	if km == nil {
+		km = keymap.Default()
+	}
+	ed := cfg.Editor
+	if ed == nil || isNilValue(ed) {
+		ed = extcmd.Editor{}
+	}
+	cls := resolveCommitLogSource(cfg.CommitLog, cfg.DiffSource)
+	reviewCfg := cloneReviewInfoConfig(cfg.ReviewInfo)
+
+	// starting with the tree hidden has to move focus to the diff, the same way
+	// toggleTreePane does when it hides the pane. Leaving focus on the tree would
+	// point the cursor keys at a pane that is not on screen.
+	startFocus := paneTree
+	if cfg.NoTree {
+		startFocus = paneDiff
+	}
+
+	return Model{
+		overlay:    cfg.Overlay,
+		keymap:     km,
+		store:      cfg.Store,
+		diffSource: cfg.DiffSource,
+		blamer:     cfg.Blamer,
+		tree:       cfg.NewFileTree(nil), // empty tree for nil-safety before first filesLoadedMsg
+		themes:     cfg.Themes,
+		editor:     ed,
+
+		defaultOutputPath: cfg.DefaultOutputPath,
+		saveAsPath:        cfg.SaveAsPath,
+		stage:             stageState{plan: stageplan.New(), applicable: cfg.Applicable.StagePlan, rangeAnchor: -1},
+		pr:                prState{reviewer: prReviewerOrNil(cfg.PRReview)},
+		remoteNotes:       groupRemoteNotes(cfg.RemoteNotes),
+		session: modelConfigState{
+			ref:                cfg.Ref,
+			staged:             cfg.Staged,
+			only:               cfg.Only,
+			workDir:            cfg.WorkDir,
+			sourceEditorPolicy: cfg.SourceEditor,
+			mouseTracking:      cfg.MouseTracking,
+			noConfirmDiscard:   cfg.NoConfirmDiscard,
+			noConfirmReload:    cfg.NoConfirmReload,
+			crossFileHunks:     cfg.CrossFileHunks,
+			startAtChange:      cfg.StartAtChange,
+			treeWidthRatio:     cfg.TreeWidthRatio,
+			mergeInProgress:    cfg.MergeInProgress,
+			annotPrefix:        cfg.AnnotationMarker + " ",
+			annotFilePrefix:    cfg.AnnotationMarker + " file: ",
+			outputPath:         cfg.OutputPath,
+		},
+		diffPane: diffPane{
+			resolver:    cfg.StyleResolver,
+			renderer:    cfg.StyleRenderer,
+			sgr:         cfg.SGR,
+			differ:      cfg.WordDiffer,
+			highlighter: cfg.Highlighter,
+			layout: layoutState{
+				focus:      startFocus,
+				treeHidden: cfg.NoTree,
+			},
+			modes: modeState{
+				wrap:           cfg.Wrap,
+				lineNumbers:    cfg.LineNumbers,
+				collapsed:      collapsedState{enabled: cfg.Collapsed},
+				wordDiff:       cfg.WordDiff,
+				showBlame:      cfg.ShowBlame && cfg.Blamer != nil,
+				showUntracked:  cfg.ShowUntracked && cfg.LoadUntracked != nil,
+				compact:        cfg.Compact && cfg.Applicable.Compact,
+				compactContext: cfg.CompactContext,
+				pageOverlap:    max(0, cfg.PageOverlap),
+			},
+			cfg: paneConfig{
+				tabSpaces:   strings.Repeat(" ", cfg.TabWidth),
+				wrapIndent:  max(0, cfg.WrapIndent),
+				noColors:    cfg.NoColors,
+				noStatusBar: cfg.NoStatusBar,
+			},
+			renderCache: &diffRenderCache{},
+		},
+		commits: commitsState{
+			source:     cls,
+			applicable: cfg.Applicable.CommitLog && cls != nil,
+		},
+		review:               reviewInfoState{cfg: reviewCfg},
+		reviewed:             reviewedState{cache: make(map[string]string), pending: make(map[string]uint64)},
+		reload:               reloadState{applicable: cfg.Applicable.Reload},
+		compact:              compactState{applicable: cfg.Applicable.Compact},
+		annot:                annotationState{rowCache: make(map[annotCacheKey][]string)},
+		loadUntracked:        cfg.LoadUntracked,
+		loadUntrackedRenames: cfg.LoadUntrackedRenames,
+		activeThemeName:      cfg.ActiveThemeName,
+	}, nil
+}
+
+// Store returns the annotation store for reading results after quit.
+func (m Model) Store() *annot.Store {
+	return m.store
+}
+
+// Discarded returns true when the user chose to discard annotations and quit.
+func (m Model) Discarded() bool {
+	return m.discarded
+}
+
+// OutputPath returns the annotation file chosen in-session through save-as
+// (or the first O flush to a default destination). Empty when the session
+// never picked a path. the composition root then falls back to its flags.
+func (m Model) OutputPath() string {
+	return m.output.path
+}
+
+// Init initializes the model by loading changed files and the commit log
+// in parallel. loadCommits returns nil when the feature is not applicable
+// (e.g. --stdin, standalone file, working-tree review), so tea.Batch harmlessly
+// drops it in those cases.
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(m.loadFiles(), m.loadCommits())
+}
+
+// Update handles messages and updates the model state.
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		if m.inConfirmDiscard {
+			return m.handleConfirmDiscardKey(msg)
+		}
+		return m.handleKey(msg)
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+	case tea.WindowSizeMsg:
+		return m.handleResize(msg)
+	case filesLoadedMsg:
+		return m.handleFilesLoaded(msg)
+	case commitsLoadedMsg:
+		return m.handleCommitsLoaded(msg)
+	case reviewStatsLoadedMsg:
+		return m.handleReviewStatsLoaded(msg)
+	case fileLoadedMsg:
+		return m.handleFileLoaded(msg)
+	case reviewFingerprintLoadedMsg:
+		return m.handleReviewFingerprintLoaded(msg)
+	case blameLoadedMsg:
+		return m.handleBlameLoaded(msg)
+	case editorFinishedMsg:
+		return m.handleEditorFinished(msg)
+	case sourceEditorFinishedMsg:
+		return m.handleSourceEditorFinished(msg)
+	case prSubmittedMsg:
+		return m.handlePRSubmitted(msg)
+	case wheelDebounceMsg:
+		return m.handleWheelDebounce(msg)
+	}
+
+	// forward other messages to the annotation editor (e.g. paste completion).
+	// re-render only when the input text actually changed: renderDiff is O(diff lines)
+	// and repainting for a message that left the value untouched is pure waste.
+	if m.annot.annotating {
+		before := m.annot.input.Value()
+		var cmd tea.Cmd
+		m.annot.input, cmd = m.annot.input.Update(msg)
+		if m.annot.input.Value() != before {
+			m.layout.viewport.SetContent(m.renderDiff())
+		}
+		return m, cmd
+	}
+
+	// forward other messages to search textinput when searching (e.g. cursor blink)
+	if m.search.active {
+		var cmd tea.Cmd
+		m.search.input, cmd = m.search.input.Update(msg)
+		return m, cmd
+	}
+
+	// forward other messages to the save-as path input (e.g. cursor blink)
+	if m.output.saving {
+		var cmd tea.Cmd
+		m.output.input, cmd = m.output.input.Update(msg)
+		return m, cmd
+	}
+
+	return m, nil
+}
+
+func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// transient hints persist for exactly one render cycle. any key that reaches
+	// this point dismisses the last hint before the new action runs.
+	m.reload.hint = ""
+	m.output.hint = ""
+	m.stage.hint = ""
+	m.compact.hint = ""
+	m.editorState.hint = ""
+	m.keys.hint = ""
+	if m.pr.submitting {
+		return m, nil // a review post is in flight, the result decides what happens next
+	}
+
+	// flush any deferred wheel work (cursor pin + diff render) before the key
+	// action runs - m.nav.diffCursor must be at its final pinned position
+	// before cursor-relative actions (j/k, save annotation, search) read it.
+	m.flushWheelPending()
+
+	// pending-reload intercept: y confirms, any other key cancels
+	if m.reload.pending {
+		return m.handlePendingReload(msg)
+	}
+	// quit with stage marks pending: y quits, any other key stays
+	if m.stage.confirmQuit {
+		return m.handleStageQuitKey(msg)
+	}
+
+	// chord-second guard: a second key arriving while a chord is pending must
+	// be consumed as the chord's second stage, regardless of any modal that
+	// would otherwise eat it. Modal-entry paths clear chord state explicitly,
+	// so coexistence should not occur in normal flow - this guard is
+	// defense-in-depth.
+	if m.keys.chordPending != "" {
+		return m.handleChordSecond(msg.String())
+	}
+
+	if handled, model, cmd := m.handleModalKey(msg); handled {
+		return model, cmd
+	}
+
+	action := m.keymap.Resolve(msg.String())
+
+	// chord-first guard: an unresolved key that is a registered chord leader
+	// enters pending state. Load-time conflict resolution guarantees no key is
+	// bound both as a standalone action and a chord prefix, so action is empty
+	// whenever IsChordLeader returns true. the guard stays purely additive.
+	if action == "" && m.keymap.IsChordLeader(msg.String()) {
+		m.keys.chordPending = msg.String()
+		m.keys.hint = "Pending: " + msg.String() + ", esc to cancel"
+		return m, nil
+	}
+
+	return m.dispatchAction(action)
+}
+
+// dispatchAction routes a resolved keymap action through overlay-open, the
+// global action switch, and the pane-specific nav fallback. It is the unified
+// dispatch path shared by keymap-resolved single keys (handleKey) and by
+// chord-resolved actions (handleChordSecond).
+func (m Model) dispatchAction(action keymap.Action) (tea.Model, tea.Cmd) {
+	if model, cmd, ok := m.handleOverlayOpen(action); ok {
+		return model, cmd
+	}
+
+	switch action {
+	case keymap.ActionDismiss:
+		return m.handleEscKey()
+	case keymap.ActionQuitDiscarding, keymap.ActionQuit:
+		return m.handleQuitAction(action)
+	case keymap.ActionStageMark, keymap.ActionStageMarkFile, keymap.ActionVisualRange, keymap.ActionCommitWithPlan:
+		return m.handleStageAction(action)
+	case keymap.ActionTogglePane:
+		m.togglePane()
+		return m, nil
+	case keymap.ActionFilter:
+		return m.handleFilterToggle()
+	case keymap.ActionFilterUnreviewed:
+		return m.handleUnreviewedFilterToggle()
+	case keymap.ActionNextItem:
+		return m.handleFileOrSearchNav(true)
+	case keymap.ActionPrevItem:
+		return m.handleFileOrSearchNav(false)
+	case keymap.ActionConfirm:
+		return m.handleEnterKey()
+	case keymap.ActionAnnotateFile:
+		return m.handleFileAnnotateKey()
+	case keymap.ActionMarkReviewed:
+		return m.handleMarkReviewed()
+	case keymap.ActionToggleCollapsed, keymap.ActionToggleCompact, keymap.ActionToggleWrap, keymap.ActionToggleTree,
+		keymap.ActionToggleLineNums, keymap.ActionToggleBlame, keymap.ActionToggleWordDiff, keymap.ActionToggleUntracked:
+		return m.handleViewToggle(action)
+	case keymap.ActionNextHunk, keymap.ActionPrevHunk:
+		return m.handleHunkNav(action == keymap.ActionNextHunk)
+	case keymap.ActionNextAnnotation, keymap.ActionPrevAnnotation:
+		return m.handleAnnotNav(action == keymap.ActionNextAnnotation)
+	case keymap.ActionReload, keymap.ActionOpenFileInEditor, keymap.ActionFlushOutput, keymap.ActionSaveAs:
+		return m.handleSessionAction(action)
+	default: // remaining actions (navigation, search, etc.) handled by pane-specific handlers below
+	}
+
+	// pane-specific navigation
+	switch m.layout.focus {
+	case paneTree:
+		return m.handleTreeAction(action)
+	case paneDiff:
+		return m.handleDiffAction(action)
+	}
+	return m, nil
+}
+
+// handleSessionAction routes the actions that reach past the panes: reloading
+// the diff, handing the file to the external editor and writing the annotation
+// output. None of them depend on which pane has the focus, so they are answered
+// before the pane dispatch, the way commit mode answers its shared actions.
+func (m Model) handleSessionAction(action keymap.Action) (tea.Model, tea.Cmd) {
+	switch action { //nolint:exhaustive // only the session actions reach here
+	case keymap.ActionReload:
+		return m.handleReload()
+	case keymap.ActionOpenFileInEditor:
+		cmd := m.openSourceEditor()
+		return m, cmd
+	case keymap.ActionFlushOutput, keymap.ActionSaveAs:
+		return m.handleOutputAction(action)
+	}
+	return m, nil
+}
+
+func (m Model) handleOverlayOpen(action keymap.Action) (tea.Model, tea.Cmd, bool) {
+	// clear pending input state on any overlay-opening action so a pending chord
+	// or vim-motion count/leader never coexists with an active overlay. the
+	// non-overlay default case short-circuits below without touching state.
+	switch action {
+	case keymap.ActionHelp:
+		m.clearPendingInputState()
+		m.overlay.OpenHelp(m.buildHelpSpec())
+		return m, nil, true
+	case keymap.ActionAnnotList:
+		m.clearPendingInputState()
+		m.overlay.OpenAnnotList(m.buildAnnotListSpec())
+		return m, nil, true
+	case keymap.ActionThemeSelect:
+		m.clearPendingInputState()
+		m.openThemeSelector()
+		return m, nil, true
+	case keymap.ActionJumpFile:
+		m.clearPendingInputState()
+		m.openFilePicker()
+		return m, nil, true
+	case keymap.ActionInfo:
+		m.clearPendingInputState()
+		cmd := m.handleInfo()
+		return m, cmd, true
+	default:
+		return m, nil, false
+	}
+}
+
+// clearPendingInputState clears all pending key-dispatch state: chord-pending,
+// chord hint, and vim-motion (count, leader, hint). Enforces the invariant
+// that these fields never coexist with an active modal. Called by modal-entry
+// paths (startSearch, startAnnotation, handleOverlayOpen) so a pending chord
+// or vim count never survives into a modal session - the early chord-second
+// guard in handleKey is defense-in-depth against accidental coexistence.
+func (m *Model) clearPendingInputState() {
+	m.keys.chordPending = ""
+	m.keys.hint = ""
+}
+
+// handleInfo opens the unified info popup. The popup is always shown
+// (no more "no commits in this mode" dead-end) - the session section
+// describes the mode, and the commits section is hidden via
+// Applicable.CommitLog when the current mode (stdin, staged, all-files,
+// no-ref, standalone files) cannot enumerate commits. On the first open
+// since the last reload, kicks off the lazy aggregate-stats fetch. the
+// session section's "lines" row shows "loading..." until reviewStatsLoadedMsg
+// arrives. Subsequent opens read from cache and return nil.
+func (m *Model) handleInfo() tea.Cmd {
+	cmd := m.triggerReviewStats()
+	m.overlay.OpenInfo(m.buildInfoSpec())
+	return cmd
+}
+
+// applyReloadCleanup clears annotations and turns off the annotated-only
+// filter if it was active. Value receiver matches handleReload and
+// handlePendingReload. store and tree are reference-holding so mutations
+// propagate without a pointer receiver.
+func (m Model) applyReloadCleanup() {
+	m.store.Clear()
+	if m.tree.FilterActive() {
+		m.tree.ToggleFilter(nil)
+	}
+}
+
+func (m Model) handlePendingReload(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.reload.pending = false
+	if msg.String() == "y" {
+		m.applyReloadCleanup()
+		m.reload.hint = "Reloaded"
+		cmd := m.triggerReload()
+		return m, cmd
+	}
+	m.reload.hint = "Reload canceled"
+	return m, nil
+}
+
+// handleChordSecond dispatches the second-stage key of a pending chord. esc
+// cancels silently, an unbound second key surfaces an "Unknown chord" hint,
+// and a resolved action flows through dispatchAction so chord-bound actions
+// reach the same handlers as keymap-resolved single keys. The local copy of
+// Model carries the cleared chord state back to bubbletea.
+func (m Model) handleChordSecond(keyStr string) (tea.Model, tea.Cmd) {
+	prefix := m.keys.chordPending
+	m.keys.chordPending = ""
+	m.keys.hint = ""
+	if keyStr == "esc" {
+		return m, nil
+	}
+	action := m.keymap.ResolveChord(prefix, keyStr)
+	if action == "" {
+		m.keys.hint = "Unknown chord: " + prefix + ">" + keyStr
+		return m, nil
+	}
+	return m.dispatchAction(action)
+}
+
+// handleReload handles the ActionReload key. In stdin mode the feature is
+// unavailable. If no annotations exist, reloads immediately. If annotations
+// exist, enters pending-confirmation state (waiting for y/other key in
+// handlePendingReload).
+func (m Model) handleReload() (tea.Model, tea.Cmd) {
+	if !m.reload.applicable {
+		m.reload.hint = "Reload not available in this session"
+		return m, nil
+	}
+	if m.store.Count() > 0 && !m.cfg.noStatusBar && !m.session.noConfirmReload {
+		m.reload.pending = true
+		m.reload.hint = "Annotations will be dropped — press y to confirm, any other key to cancel"
+		return m, nil
+	}
+	if m.store.Count() > 0 {
+		m.applyReloadCleanup()
+	}
+	m.reload.hint = "Reloaded"
+	cmd := m.triggerReload()
+	return m, cmd
+}
+
+func (m Model) handleModalKey(msg tea.KeyMsg) (bool, tea.Model, tea.Cmd) {
+	// save-as path prompt owns every key while open
+	if m.output.saving {
+		model, cmd := m.handleSaveAsKey(msg)
+		return true, model, cmd
+	}
+
+	// annotation input mode takes priority
+	if m.annot.annotating {
+		model, cmd := m.handleAnnotateKey(msg)
+		return true, model, cmd
+	}
+
+	// search input mode takes priority after annotation
+	if m.search.active {
+		model, cmd := m.handleSearchKey(msg)
+		return true, model, cmd
+	}
+
+	// overlay popup dispatch (help, annotation list, theme selector)
+	if m.overlay.Active() {
+		action := m.keymap.Resolve(msg.String())
+		out := m.overlay.HandleKey(msg, action)
+		switch out.Kind {
+		case overlay.OutcomeAnnotationChosen:
+			model, cmd := m.jumpToAnnotationTarget(out.AnnotationTarget)
+			return true, model, cmd
+		case overlay.OutcomeThemePreview:
+			m.previewThemeByName(out.ThemeChoice.Name)
+		case overlay.OutcomeThemeConfirmed:
+			m.confirmThemeByName(out.ThemeChoice.Name)
+		case overlay.OutcomeThemeCanceled:
+			m.cancelThemeSelect()
+		case overlay.OutcomeFileChosen:
+			model, cmd := m.jumpToFile(out.FileChoice.Path)
+			return true, model, cmd
+		case overlay.OutcomeMenuChosen:
+			if isPRMenuChoice(out.MenuChoice) {
+				model, cmd := m.handlePRMenuChoice(out.MenuChoice)
+				return true, model, cmd
+			}
+		case overlay.OutcomeClosed, overlay.OutcomeNone, overlay.OutcomeConfirmed,
+			overlay.OutcomePromptSubmitted, overlay.OutcomePromptEditor:
+		}
+		return true, m, nil
+	}
+
+	return false, m, nil
+}
+
+// treePaneHidden reports whether the user toggled the tree pane off.
+func (m Model) treePaneHidden() bool {
+	return m.layout.treeHidden
+}
+
+// isCursorLine returns true when the diff line at idx is the active cursor line.
+func (m Model) isCursorLine(idx int) bool {
+	return idx == m.nav.diffCursor && m.layout.focus == paneDiff && !m.nav.onAnnotationRow
+}
+
+// togglePane switches focus between tree and diff panes.
+// only switches to diff pane when a file is loaded.
+func (m *Model) togglePane() {
+	if m.treePaneHidden() {
+		return
+	}
+	if m.layout.focus != paneTree {
+		m.layout.focus = paneTree
+		return
+	}
+	if m.file.name != "" {
+		m.layout.focus = paneDiff
+	}
+}
+
+// applyTreeWidth sizes the tree pane from the configured ratio (0 while it is
+// hidden) and returns the width left for the diff pane.
+func (m *Model) applyTreeWidth() int {
+	if m.treePaneHidden() {
+		m.layout.treeWidth = 0
+		return m.layout.width - 2 // diff pane borders only
+	}
+	m.layout.treeWidth = max(minTreeWidth, m.layout.width*m.session.treeWidthRatio/10)
+	return m.layout.width - m.layout.treeWidth - 4 // borders of both panes
+}
+
+// toggleTreePane hides or shows the tree pane.
+func (m *Model) toggleTreePane() {
+	m.layout.treeHidden = !m.layout.treeHidden
+	if m.layout.treeHidden {
+		m.layout.focus = paneDiff
+	}
+	m.layout.viewport.Width = m.applyTreeWidth()
+	m.layout.viewport.Height = max(1, m.paneHeight()-1-m.noteRows())
+	m.syncViewportToCursor()
+}
+
+// toggleLineNumbers toggles line number display on/off and recomputes gutter width.
+func (m *Model) toggleLineNumbers() {
+	if m.layout.focus != paneDiff || m.file.name == "" {
+		return
+	}
+	m.modes.lineNumbers = !m.modes.lineNumbers
+	if m.modes.lineNumbers {
+		m.file.lineNumWidth = m.computeLineNumWidth()
+	}
+	m.syncViewportToCursor()
+}
+
+// computeLineNumWidth returns the digit width needed for line number columns.
+// scans all file lines to find the maximum old or new line number.
+func (m Model) computeLineNumWidth() int {
+	maxNum := 0
+	for _, dl := range m.file.lines {
+		if dl.OldNum > maxNum {
+			maxNum = dl.OldNum
+		}
+		if dl.NewNum > maxNum {
+			maxNum = dl.NewNum
+		}
+	}
+	if maxNum == 0 {
+		return 1
+	}
+	return len(strconv.Itoa(maxNum))
+}
+
+// toggleBlame toggles the blame gutter on/off. returns a tea.Cmd to load blame data async.
+func (m *Model) toggleBlame() tea.Cmd {
+	if m.layout.focus != paneDiff || m.file.name == "" || m.blamer == nil {
+		return nil
+	}
+	m.modes.showBlame = !m.modes.showBlame
+	if m.modes.showBlame {
+		m.file.blameData = nil
+		m.file.blameAuthorLen = 0
+		return m.loadBlame(m.file.name)
+	}
+	m.file.blameData = nil
+	m.file.blameAuthorLen = 0
+	m.syncViewportToCursor()
+	return nil
+}
+
+// toggleWordDiff toggles intra-line word-diff highlighting on/off.
+// recomputeIntraRanges honors the new wordDiff state: it populates ranges
+// when enabling and clears them when disabling.
+// no-op when the diff pane is not focused or no file is loaded.
+func (m *Model) toggleWordDiff() {
+	if m.layout.focus != paneDiff || m.file.name == "" {
+		return
+	}
+	m.modes.wordDiff = !m.modes.wordDiff
+	m.recomputeIntraRanges()
+	m.layout.viewport.SetContent(m.renderDiff())
+}
+
+// toggleUntracked hides the untracked files or brings them back. They are
+// part of the review by default.
+func (m *Model) toggleUntracked() tea.Cmd {
+	m.modes.showUntracked = !m.modes.showUntracked
+	m.filesLoadSeq++
+	return m.loadFiles()
+}
+
+// toggleCompactMode switches between compact (small-context) and full-file
+// diff mode and re-fetches the currently displayed file so the new context
+// size takes effect. Other files re-fetch naturally on next navigation. When
+// the feature is not applicable in the current mode (e.g. --stdin, --all-files,
+// standalone FileReader), sets a transient status-bar hint and returns nil -
+// mode stays unchanged and no re-fetch is issued. The cursor position is
+// preserved across the toggle via a compactAnchor captured before the re-fetch
+// and restored in handleFileLoaded, instead of resetting to the top.
+func (m *Model) toggleCompactMode() tea.Cmd {
+	if !m.compact.applicable {
+		m.compact.hint = "compact not applicable in this mode"
+		return nil
+	}
+	anchor := m.captureCompactAnchor()
+	m.modes.compact = !m.modes.compact
+	cmd := m.reloadCurrentFile()
+	if cmd != nil && anchor != nil {
+		anchor.seq = m.file.loadSeq
+		m.compact.pendingAnchor = anchor
+	}
+	return cmd
+}
+
+// handleViewToggle dispatches view mode toggle actions.
+func (m Model) handleViewToggle(action keymap.Action) (tea.Model, tea.Cmd) {
+	switch action {
+	case keymap.ActionToggleCollapsed:
+		m.toggleCollapsedMode()
+	case keymap.ActionToggleWrap:
+		m.toggleWrapMode()
+	case keymap.ActionToggleTree:
+		m.toggleTreePane()
+	case keymap.ActionToggleLineNums:
+		m.toggleLineNumbers()
+	case keymap.ActionToggleBlame:
+		cmd := m.toggleBlame()
+		return m, cmd
+	case keymap.ActionToggleWordDiff:
+		m.toggleWordDiff()
+	case keymap.ActionToggleUntracked:
+		cmd := m.toggleUntracked()
+		return m, cmd
+	case keymap.ActionToggleCompact:
+		cmd := m.toggleCompactMode()
+		return m, cmd
+	default:
+		return m, nil
+	}
+	return m, nil
+}
+
+// toggleWrapMode toggles line wrapping on/off.
+// resets horizontal scroll when enabling wrap and re-renders the diff.
+func (m *Model) toggleWrapMode() {
+	if m.layout.focus != paneDiff || m.file.name == "" {
+		return
+	}
+	m.modes.wrap = !m.modes.wrap
+	if m.modes.wrap {
+		m.layout.scrollX = 0
+	}
+	m.syncViewportToCursor()
+}
+
+func (m Model) handleResize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
+	m.layout.width = msg.Width
+	m.layout.height = msg.Height
+
+	diffWidth := m.applyTreeWidth()
+	diffHeight := max(1, m.paneHeight()-1-m.noteRows()) // pane height minus diff header and note
+
+	if !m.ready {
+		m.layout.viewport = viewport.New(diffWidth, diffHeight)
+		m.ready = true
+	} else {
+		m.layout.viewport.Width = diffWidth
+		m.layout.viewport.Height = diffHeight
+	}
+
+	m.tree.EnsureVisible(m.treePageSize())
+
+	if m.file.name != "" {
+		// flush deferred wheel pin before syncViewportToCursor so the post-resize
+		// scroll is anchored to the user's wheeled-to position rather than the
+		// pre-burst cursor. extra render is rare (resize during wheel burst).
+		m.flushWheelPending()
+		m.syncViewportToCursor()
+	}
+
+	return m, nil
+}
+
+// prReviewerOrNil collapses a typed-nil PRReviewer to nil.
+func prReviewerOrNil(r PRReviewer) PRReviewer {
+	if depMissing(r) {
+		return nil
+	}
+	return r
+}
+
+// cloneReviewInfoConfig returns a deep copy of cfg so the model owns its own
+// review-info state. a later mutation through the caller's reference must not
+// alias model state. nil passes through unchanged so the "review-info
+// disabled" off-switch is preserved.
+func cloneReviewInfoConfig(cfg *ReviewInfoConfig) *ReviewInfoConfig {
+	if cfg == nil {
+		return nil
+	}
+	cp := *cfg
+	if cfg.Only != nil {
+		cp.Only = append([]string(nil), cfg.Only...)
+	}
+	if cfg.Include != nil {
+		cp.Include = append([]string(nil), cfg.Include...)
+	}
+	if cfg.Exclude != nil {
+		cp.Exclude = append([]string(nil), cfg.Exclude...)
+	}
+	return &cp
+}
+
+// resolveCommitLogSource picks the commit-log source for the model from an
+// explicit ModelConfig.CommitLog field (taking precedence) or, when that is
+// nil or a typed-nil interface, falls back to the diff source's optional
+// git.CommitLogger capability. Returns nil when neither path produces a
+// usable source - the caller treats nil as "feature unavailable".
+func resolveCommitLogSource(explicit commitLogSource, src DiffSource) commitLogSource {
+	if explicit != nil && !isNilValue(explicit) {
+		return explicit
+	}
+	if cl, ok := src.(git.CommitLogger); ok {
+		return cl
+	}
+	return nil
+}

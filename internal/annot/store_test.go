@@ -1,0 +1,620 @@
+package annot
+
+import (
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestStore_Add(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "use errors.Is()"})
+
+	anns := s.Get("handler.go")
+	require.Len(t, anns, 1)
+	assert.Equal(t, Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "use errors.Is()"}, anns[0])
+}
+
+func TestStore_AddReplacesExisting(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "old comment"})
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "new comment"})
+
+	anns := s.Get("handler.go")
+	require.Len(t, anns, 1)
+	assert.Equal(t, "new comment", anns[0].Comment)
+}
+
+func TestStore_AddReplacesExistingPreservesEndLine(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "old comment", EndLine: 0})
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "refactor this hunk", EndLine: 67})
+
+	anns := s.Get("handler.go")
+	require.Len(t, anns, 1)
+	assert.Equal(t, "refactor this hunk", anns[0].Comment)
+	assert.Equal(t, 67, anns[0].EndLine, "EndLine should be updated on replacement")
+}
+
+func TestStore_AddReplacesExistingClearsEndLine(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "refactor this hunk", EndLine: 67})
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "just a note", EndLine: 0})
+
+	anns := s.Get("handler.go")
+	require.Len(t, anns, 1)
+	assert.Equal(t, "just a note", anns[0].Comment)
+	assert.Equal(t, 0, anns[0].EndLine, "EndLine should be cleared when replacement has no range")
+}
+
+func TestStore_AddMultipleLines(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "first"})
+	s.Add(Annotation{File: "handler.go", Line: 10, Type: "-", Comment: "second"})
+
+	anns := s.Get("handler.go")
+	require.Len(t, anns, 2)
+	// sorted by line number
+	assert.Equal(t, 10, anns[0].Line)
+	assert.Equal(t, 43, anns[1].Line)
+}
+
+func TestStore_AddMultipleFiles(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "first"})
+	s.Add(Annotation{File: "store.go", Line: 18, Type: "-", Comment: "second"})
+
+	assert.Len(t, s.Get("handler.go"), 1)
+	assert.Len(t, s.Get("store.go"), 1)
+}
+
+func TestStore_Delete(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "comment"})
+
+	ok := s.Delete("handler.go", 43, "+")
+	assert.True(t, ok)
+	assert.Empty(t, s.Get("handler.go"))
+}
+
+func TestStore_DeleteCleansUpEmptyFile(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "comment"})
+	s.Delete("handler.go", 43, "+")
+
+	all := s.All()
+	_, exists := all["handler.go"]
+	assert.False(t, exists, "file entry should be removed when last annotation deleted")
+}
+
+func TestStore_DeleteNonExistent(t *testing.T) {
+	s := NewStore()
+	ok := s.Delete("handler.go", 43, "+")
+	assert.False(t, ok)
+}
+
+func TestStore_DeletePreservesOthers(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 10, Type: "+", Comment: "keep"})
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "-", Comment: "remove"})
+
+	s.Delete("handler.go", 43, "-")
+	anns := s.Get("handler.go")
+	require.Len(t, anns, 1)
+	assert.Equal(t, 10, anns[0].Line)
+}
+
+func TestStore_DeleteMatchesByType(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 5, Type: "+", Comment: "added line"})
+	s.Add(Annotation{File: "handler.go", Line: 5, Type: "-", Comment: "removed line"})
+
+	// deleting the add should leave the remove
+	ok := s.Delete("handler.go", 5, "+")
+	assert.True(t, ok)
+	anns := s.Get("handler.go")
+	require.Len(t, anns, 1)
+	assert.Equal(t, "-", anns[0].Type)
+	assert.Equal(t, "removed line", anns[0].Comment)
+}
+
+func TestStore_AddSameLineDifferentTypes(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 5, Type: "+", Comment: "added line"})
+	s.Add(Annotation{File: "handler.go", Line: 5, Type: "-", Comment: "removed line"})
+
+	anns := s.Get("handler.go")
+	require.Len(t, anns, 2, "same line number with different types should be separate annotations")
+}
+
+func TestStore_GetEmpty(t *testing.T) {
+	s := NewStore()
+	anns := s.Get("nonexistent.go")
+	assert.Empty(t, anns)
+}
+
+func TestStore_GetReturnsCopy(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "comment"})
+
+	anns := s.Get("handler.go")
+	anns[0].Comment = "modified"
+
+	original := s.Get("handler.go")
+	assert.Equal(t, "comment", original[0].Comment, "Get should return a copy")
+}
+
+func TestStore_All(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "first"})
+	s.Add(Annotation{File: "store.go", Line: 18, Type: "-", Comment: "second"})
+
+	all := s.All()
+	assert.Len(t, all, 2)
+	assert.Len(t, all["handler.go"], 1)
+	assert.Len(t, all["store.go"], 1)
+}
+
+func TestStore_AllEmpty(t *testing.T) {
+	s := NewStore()
+	all := s.All()
+	assert.Empty(t, all)
+}
+
+func TestStore_AllReturnsCopy(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "comment"})
+
+	all := s.All()
+	all["handler.go"][0].Comment = "modified"
+
+	original := s.All()
+	assert.Equal(t, "comment", original["handler.go"][0].Comment, "All should return a copy")
+}
+
+func TestStore_Files(t *testing.T) {
+	s := NewStore()
+	assert.Empty(t, s.Files())
+
+	s.Add(Annotation{File: "z_file.go", Line: 1, Type: "+", Comment: "comment"})
+	s.Add(Annotation{File: "a_file.go", Line: 2, Type: "-", Comment: "comment"})
+	files := s.Files()
+	require.Len(t, files, 2)
+	assert.Equal(t, "a_file.go", files[0])
+	assert.Equal(t, "z_file.go", files[1])
+}
+
+func TestStore_FormatOutputEmpty(t *testing.T) {
+	s := NewStore()
+	assert.Empty(t, s.FormatOutput())
+}
+
+func TestStore_FormatOutputSingle(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "use errors.Is() instead of direct comparison"})
+
+	expected := "## handler.go:43 (+)\nuse errors.Is() instead of direct comparison\n"
+	assert.Equal(t, expected, s.FormatOutput())
+}
+
+func TestStore_FormatOutputMultiFile(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "use errors.Is() instead of direct comparison"})
+	s.Add(Annotation{File: "store.go", Line: 18, Type: "-", Comment: "don't remove this validation"})
+
+	expected := "## handler.go:43 (+)\n" +
+		"use errors.Is() instead of direct comparison\n" +
+		"\n" +
+		"## store.go:18 (-)\n" +
+		"don't remove this validation\n"
+	assert.Equal(t, expected, s.FormatOutput())
+}
+
+func TestStore_FormatOutputMultiLinesSameFile(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "fix this"})
+	s.Add(Annotation{File: "handler.go", Line: 10, Type: " ", Comment: "add docs"})
+
+	expected := "## handler.go:10 ( )\n" +
+		"add docs\n" +
+		"\n" +
+		"## handler.go:43 (+)\n" +
+		"fix this\n"
+	assert.Equal(t, expected, s.FormatOutput())
+}
+
+func TestStore_AddFileLevelAnnotation(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 0, Type: "", Comment: "this file needs refactoring"})
+
+	anns := s.Get("handler.go")
+	require.Len(t, anns, 1)
+	assert.Equal(t, Annotation{File: "handler.go", Line: 0, Type: "", Comment: "this file needs refactoring"}, anns[0])
+}
+
+func TestStore_AddFileLevelReplacesExisting(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 0, Type: "", Comment: "old comment"})
+	s.Add(Annotation{File: "handler.go", Line: 0, Type: "", Comment: "new comment"})
+
+	anns := s.Get("handler.go")
+	require.Len(t, anns, 1)
+	assert.Equal(t, "new comment", anns[0].Comment)
+}
+
+func TestStore_DeleteFileLevelAnnotation(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 0, Type: "", Comment: "file comment"})
+
+	ok := s.Delete("handler.go", 0, "")
+	assert.True(t, ok)
+	assert.Empty(t, s.Get("handler.go"))
+}
+
+func TestStore_DeleteFileLevelPreservesLineAnnotations(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 0, Type: "", Comment: "file comment"})
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "line comment"})
+
+	s.Delete("handler.go", 0, "")
+	anns := s.Get("handler.go")
+	require.Len(t, anns, 1)
+	assert.Equal(t, 43, anns[0].Line)
+}
+
+func TestStore_GetFileLevelWithLineAnnotations(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "line comment"})
+	s.Add(Annotation{File: "handler.go", Line: 0, Type: "", Comment: "file comment"})
+	s.Add(Annotation{File: "handler.go", Line: 10, Type: "-", Comment: "another line"})
+
+	anns := s.Get("handler.go")
+	require.Len(t, anns, 3)
+	// sorted by line: file-level (0) first, then 10, then 43
+	assert.Equal(t, 0, anns[0].Line)
+	assert.Equal(t, 10, anns[1].Line)
+	assert.Equal(t, 43, anns[2].Line)
+}
+
+func TestStore_FormatOutputFileLevelOnly(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 0, Type: "", Comment: "this file needs refactoring"})
+
+	expected := "## handler.go (file-level)\nthis file needs refactoring\n"
+	assert.Equal(t, expected, s.FormatOutput())
+}
+
+func TestStore_FormatOutputFileLevelBeforeLineAnnotations(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "fix this"})
+	s.Add(Annotation{File: "handler.go", Line: 0, Type: "", Comment: "file needs refactoring"})
+
+	expected := "## handler.go (file-level)\nfile needs refactoring\n" +
+		"\n" +
+		"## handler.go:43 (+)\nfix this\n"
+	assert.Equal(t, expected, s.FormatOutput())
+}
+
+func TestStore_FormatOutputMixedFileLevelAndLineMultiFile(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "a_file.go", Line: 0, Type: "", Comment: "file-level note for a"})
+	s.Add(Annotation{File: "a_file.go", Line: 10, Type: "+", Comment: "line note for a"})
+	s.Add(Annotation{File: "b_file.go", Line: 5, Type: "-", Comment: "line note for b"})
+	s.Add(Annotation{File: "b_file.go", Line: 0, Type: "", Comment: "file-level note for b"})
+
+	expected := "## a_file.go (file-level)\nfile-level note for a\n" +
+		"\n" +
+		"## a_file.go:10 (+)\nline note for a\n" +
+		"\n" +
+		"## b_file.go (file-level)\nfile-level note for b\n" +
+		"\n" +
+		"## b_file.go:5 (-)\nline note for b\n"
+	assert.Equal(t, expected, s.FormatOutput())
+}
+
+func TestStore_FormatOutputSortedByFilename(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "z_file.go", Line: 1, Type: "+", Comment: "last"})
+	s.Add(Annotation{File: "a_file.go", Line: 1, Type: "-", Comment: "first"})
+
+	out := s.FormatOutput()
+	aIdx := strings.Index(out, "## a_file.go")
+	zIdx := strings.Index(out, "## z_file.go")
+	require.GreaterOrEqual(t, aIdx, 0, "a_file should be in output")
+	require.GreaterOrEqual(t, zIdx, 0, "z_file should be in output")
+	assert.Less(t, aIdx, zIdx, "a_file should come before z_file")
+	assert.Contains(t, out, "## a_file.go:1 (-)\nfirst\n")
+	assert.Contains(t, out, "## z_file.go:1 (+)\nlast\n")
+}
+
+// verifies that annotations work correctly on context-only lines (type " "),
+// which is the type used when viewing files without git changes.
+func TestStore_ContextOnlyAnnotations(t *testing.T) {
+	s := NewStore()
+
+	// add annotations on context lines (type " ")
+	s.Add(Annotation{File: "plan.md", Line: 3, Type: " ", Comment: "clarify this step"})
+	s.Add(Annotation{File: "plan.md", Line: 7, Type: " ", Comment: "add more detail"})
+
+	anns := s.Get("plan.md")
+	require.Len(t, anns, 2)
+	assert.Equal(t, 3, anns[0].Line)
+	assert.Equal(t, " ", anns[0].Type)
+	assert.Equal(t, "clarify this step", anns[0].Comment)
+	assert.Equal(t, 7, anns[1].Line)
+
+	// verify output format
+	out := s.FormatOutput()
+	assert.Contains(t, out, "## plan.md:3 ( )")
+	assert.Contains(t, out, "clarify this step")
+	assert.Contains(t, out, "## plan.md:7 ( )")
+	assert.Contains(t, out, "add more detail")
+
+	// verify Has works
+	assert.True(t, s.Has("plan.md", 3, " "))
+	assert.False(t, s.Has("plan.md", 3, "+"))
+
+	// verify Delete works
+	ok := s.Delete("plan.md", 3, " ")
+	assert.True(t, ok)
+	assert.Len(t, s.Get("plan.md"), 1)
+}
+
+func TestStore_FormatOutputEndLineZero(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "fix this"})
+
+	expected := "## handler.go:43 (+)\nfix this\n"
+	assert.Equal(t, expected, s.FormatOutput(), "EndLine=0 should produce single line number")
+}
+
+func TestStore_FormatOutputEndLineRange(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, EndLine: 67, Type: "+", Comment: "refactor this hunk"})
+
+	expected := "## handler.go:43-67 (+)\nrefactor this hunk\n"
+	assert.Equal(t, expected, s.FormatOutput(), "EndLine>0 should produce line range")
+}
+
+func TestStore_FormatOutputFileLevelIgnoresEndLine(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 0, EndLine: 50, Type: "", Comment: "file comment"})
+
+	expected := "## handler.go (file-level)\nfile comment\n"
+	assert.Equal(t, expected, s.FormatOutput(), "file-level annotations should ignore EndLine")
+}
+
+func TestStore_FormatOutputMultiLineComment(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "first point\nsecond point\nthird point"})
+
+	expected := "## handler.go:43 (+)\nfirst point\nsecond point\nthird point\n"
+	assert.Equal(t, expected, s.FormatOutput(), "multi-line comment should flow through with embedded newlines preserved")
+}
+
+func TestStore_FormatOutputMultiLineFileLevel(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 0, Type: "", Comment: "line 1\nline 2"})
+
+	expected := "## handler.go (file-level)\nline 1\nline 2\n"
+	assert.Equal(t, expected, s.FormatOutput(), "multi-line file-level comment should preserve newlines")
+}
+
+func TestStore_FormatOutputMixedSingleAndMultiLine(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 10, Type: "+", Comment: "one-liner"})
+	s.Add(Annotation{File: "handler.go", Line: 20, Type: "-", Comment: "multi\nline\ncomment"})
+	s.Add(Annotation{File: "handler.go", Line: 30, Type: " ", Comment: "another one-liner"})
+
+	expected := "## handler.go:10 (+)\none-liner\n" +
+		"\n" +
+		"## handler.go:20 (-)\nmulti\nline\ncomment\n" +
+		"\n" +
+		"## handler.go:30 ( )\nanother one-liner\n"
+	assert.Equal(t, expected, s.FormatOutput(), "mixed single/multi-line annotations should use ## as unambiguous delimiter")
+}
+
+func TestStore_FormatOutputMultiLineDelimiterIntegrity(t *testing.T) {
+	s := NewStore()
+	// body lines that start with "##" are prefixed with a single space on output
+	// so parsers splitting on "## " record headers cannot confuse them for a new record.
+	s.Add(Annotation{File: "handler.go", Line: 1, Type: "+", Comment: "normal\n## not a header\nmore"})
+	s.Add(Annotation{File: "handler.go", Line: 2, Type: "+", Comment: "next entry"})
+
+	out := s.FormatOutput()
+	// embedded "##" line must be space-prefixed so the line no longer looks like a record header
+	assert.Contains(t, out, "## handler.go:1 (+)\nnormal\n ## not a header\nmore\n")
+	assert.Contains(t, out, "## handler.go:2 (+)\nnext entry\n")
+	// the count of "## handler.go:" records must match actual record count (2, not 3)
+	assert.Equal(t, 2, strings.Count(out, "## handler.go:"))
+	// the escaped body line should never appear as a bare "## not a header" record header
+	assert.NotContains(t, out, "\n## not a header\n")
+}
+
+func TestStore_FormatOutputEscapesHeaderLinesAtStart(t *testing.T) {
+	s := NewStore()
+	// body starting with "##" (no leading newline) must be escaped on the first line too
+	s.Add(Annotation{File: "a.go", Line: 1, Type: "+", Comment: "## starts with hash\nsecond"})
+
+	out := s.FormatOutput()
+	assert.Contains(t, out, "## a.go:1 (+)\n ## starts with hash\nsecond\n", "first body line starting with ## must be space-prefixed")
+	assert.Equal(t, 1, strings.Count(out, "## a.go:"), "escaping must produce exactly one record header")
+}
+
+func TestStore_FormatOutputDoesNotEscapeNonHeaderHash(t *testing.T) {
+	s := NewStore()
+	// "## " mid-line or single "#" lines must not be touched
+	s.Add(Annotation{File: "a.go", Line: 1, Type: "+", Comment: "word ## mid\n# single hash\nok"})
+
+	out := s.FormatOutput()
+	assert.Contains(t, out, "word ## mid\n# single hash\nok\n", "non-leading ## and single # must be preserved verbatim")
+}
+
+func TestStore_FormatOutputDoesNotEscapeDeeperMarkdownHeaders(t *testing.T) {
+	s := NewStore()
+	// "### subheader" and deeper markdown heading forms must pass through
+	// unchanged - they cannot collide with the "## " record-header split marker.
+	s.Add(Annotation{File: "a.go", Line: 1, Type: "+", Comment: "### section\n#### deeper\nbody"})
+
+	out := s.FormatOutput()
+	assert.Contains(t, out, "### section\n#### deeper\nbody\n", "### and deeper markdown headers must not be space-prefixed")
+	assert.NotContains(t, out, " ### section", "### must not be escaped — only the record-header '## ' form")
+}
+
+func TestStore_FormatOutputEscapesOnlyRecordHeaderForm(t *testing.T) {
+	s := NewStore()
+	// body line "## file-looking-line" is the record-header form and MUST be escaped,
+	// while "###" lines must pass through.
+	s.Add(Annotation{File: "a.go", Line: 1, Type: "+", Comment: "## file-looking-line\n### subheader\n"})
+
+	out := s.FormatOutput()
+	assert.Contains(t, out, " ## file-looking-line", "record-header '## ' form must be space-prefixed")
+	assert.Contains(t, out, "### subheader", "### subheader must pass through unchanged")
+}
+
+func TestStore_Clear(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "a.go", Line: 1, Type: "+", Comment: "note"})
+	s.Add(Annotation{File: "b.go", Line: 2, Type: "-", Comment: "other"})
+	require.Equal(t, 2, s.Count())
+
+	s.Clear()
+	assert.Equal(t, 0, s.Count(), "Clear must remove all annotations")
+	assert.Empty(t, s.All(), "All must return empty map after Clear")
+}
+
+func TestStore_WriteFile(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "use errors.Is()"})
+
+	path := filepath.Join(t.TempDir(), "output.md")
+	snapshot, err := s.WriteFile(path)
+	require.NoError(t, err)
+
+	got, err := os.ReadFile(path) //nolint:gosec // test path from t.TempDir()
+	require.NoError(t, err)
+	assert.Equal(t, s.FormatOutput(), snapshot, "returned snapshot must equal FormatOutput()")
+	assert.Equal(t, snapshot, string(got), "returned snapshot must equal the written bytes")
+}
+
+func TestStore_WriteFileOverwritesExisting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "output.md")
+	require.NoError(t, os.WriteFile(path, []byte("stale content that is longer than the new content"), 0o600))
+
+	s := NewStore()
+	s.Add(Annotation{File: "handler.go", Line: 43, Type: "+", Comment: "note"})
+	_, err := s.WriteFile(path)
+	require.NoError(t, err)
+
+	got, err := os.ReadFile(path) //nolint:gosec // test path from t.TempDir()
+	require.NoError(t, err)
+	assert.Equal(t, s.FormatOutput(), string(got), "overwrite must replace stale content entirely")
+}
+
+func TestStore_WriteFileEmptyStore(t *testing.T) {
+	s := NewStore()
+	path := filepath.Join(t.TempDir(), "output.md")
+	_, err := s.WriteFile(path)
+	require.NoError(t, err)
+
+	got, err := os.ReadFile(path) //nolint:gosec // test path from t.TempDir()
+	require.NoError(t, err)
+	assert.Empty(t, string(got), "empty store writes an empty file")
+}
+
+func TestStore_WriteFileMode(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "a.go", Line: 1, Type: "+", Comment: "note"})
+
+	path := filepath.Join(t.TempDir(), "output.md")
+	_, err := s.WriteFile(path)
+	require.NoError(t, err)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, fs.FileMode(0o600), info.Mode().Perm(), "resulting file mode must be 0o600")
+}
+
+func TestStore_WriteFileNoLeftoverTempOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore()
+	s.Add(Annotation{File: "a.go", Line: 1, Type: "+", Comment: "note"})
+	_, err := s.WriteFile(filepath.Join(dir, "output.md"))
+	require.NoError(t, err)
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "only the target file should remain")
+	assert.Equal(t, "output.md", entries[0].Name(), "no temp file should be left behind")
+}
+
+func TestStore_WriteFileMissingDir(t *testing.T) {
+	s := NewStore()
+	s.Add(Annotation{File: "a.go", Line: 1, Type: "+", Comment: "note"})
+
+	// a missing parent directory is created on demand
+	dir := filepath.Join(t.TempDir(), "does-not-exist")
+	_, err := s.WriteFile(filepath.Join(dir, "output.md"))
+	require.NoError(t, err)
+	assert.FileExists(t, filepath.Join(dir, "output.md"))
+
+	// a parent that is a regular file cannot become a directory
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	require.NoError(t, os.WriteFile(blocker, []byte("x"), 0o600))
+	_, err = s.WriteFile(filepath.Join(blocker, "output.md"))
+	require.Error(t, err, "writing under a regular file must fail")
+	assert.ErrorContains(t, err, "write annotations")
+}
+
+func TestStore_WriteFileRemovesTempOnRenameError(t *testing.T) {
+	dir := t.TempDir()
+	// target path is an existing directory: rename of a file over it fails,
+	// so the temp file must be created and then removed on the error path
+	target := filepath.Join(dir, "output.md")
+	require.NoError(t, os.Mkdir(target, 0o750))
+
+	s := NewStore()
+	s.Add(Annotation{File: "a.go", Line: 1, Type: "+", Comment: "note"})
+	_, err := s.WriteFile(target)
+	require.Error(t, err, "rename over a directory must fail")
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "temp file must be removed on error")
+	assert.Equal(t, "output.md", entries[0].Name(), "only the pre-existing directory should remain")
+}
+
+func TestStore_Count(t *testing.T) {
+	s := NewStore()
+	assert.Equal(t, 0, s.Count(), "empty store should return 0")
+
+	s.Add(Annotation{File: "a.go", Line: 1, Type: "+", Comment: "one"})
+	assert.Equal(t, 1, s.Count())
+
+	s.Add(Annotation{File: "a.go", Line: 5, Type: "-", Comment: "two"})
+	assert.Equal(t, 2, s.Count())
+
+	s.Add(Annotation{File: "b.go", Line: 1, Type: "+", Comment: "three"})
+	assert.Equal(t, 3, s.Count(), "should count across multiple files")
+
+	s.Delete("a.go", 1, "+")
+	assert.Equal(t, 2, s.Count(), "count should decrease after delete")
+}
+
+func TestStore_WriteFile_createsMissingDirAndExpandsHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st := NewStore()
+	st.Add(Annotation{File: "a.go", Line: 1, Type: "+", Comment: "note"})
+	content, err := st.WriteFile("~/deep/nested/out.md")
+	require.NoError(t, err)
+	data, err := os.ReadFile(filepath.Join(home, "deep", "nested", "out.md")) //nolint:gosec // test reads a file under t.TempDir
+	require.NoError(t, err)
+	assert.Equal(t, content, string(data))
+	assert.Contains(t, content, "## a.go:1 (+)")
+}

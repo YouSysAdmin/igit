@@ -1,0 +1,285 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+
+	"github.com/yousysadmin/igit/internal/annot"
+	"github.com/yousysadmin/igit/internal/git"
+	"github.com/yousysadmin/igit/internal/tui"
+)
+
+// maxAnnotationsFileSize caps the bytes read from --annotations. Annotation
+// files aggregate many records (LLM reviews, history exports) so 1 MiB is a
+// generous practical ceiling. anything larger almost certainly indicates the
+// flag was pointed at the wrong file.
+const maxAnnotationsFileSize = 1 << 20
+
+// preloader bundles the inputs and warning sink for --annotations preload.
+// All helpers are methods so call-sites stay free of the wide parameter
+// lists earlier shapes accumulated.
+type preloader struct {
+	store              *annot.Store
+	source             tui.DiffSource
+	ref                string
+	staged             bool
+	untrackedFn        func() ([]string, error)
+	untrackedRenamesFn func([]string) ([]git.FileEntry, error)
+	workDir            string
+	warnOut            io.Writer
+
+	// lineCache memoises the (line, change-type) set per file so
+	// repeated annotations on the same file do not re-fetch its diff.
+	lineCache map[string]map[lineKey]struct{}
+
+	// renames maps a file's current path to its rename origin so the
+	// per-file diff is rename-aware (matches the displayed minimal diff).
+	renames map[string]string
+}
+
+type lineKey struct {
+	line int
+	kind string
+}
+
+// preloadAnnotations parses the markdown file at path (same format as
+// Store.FormatOutput) and feeds each record through store.Add after dropping
+// orphans against the resolved diff. file-level records (Line == 0) require
+// only that the file be present in ChangedFiles. Line-scoped records require
+// both the file and a matching DiffLine (same line number for the record's
+// change type) to be present. Untracked files (surfaced in the UI via the
+// show-untracked toggle) are folded in via untrackedFn so annotations saved
+// against them round-trip. their line-set is read from disk as all-added
+// lines, mirroring ui.resolveEmptyDiff. Dropped records are warned to warnOut.
+func preloadAnnotations(path string, store *annot.Store, source tui.DiffSource, ref string, staged bool,
+	untrackedFn func() ([]string, error), untrackedRenamesFn func([]string) ([]git.FileEntry, error),
+	workDir string, warnOut io.Writer,
+) error {
+	records, err := readAnnotationsFile(path)
+	if err != nil {
+		return err
+	}
+	return preloadRecords(records, store, source, ref, staged, untrackedFn, untrackedRenamesFn, workDir, warnOut)
+}
+
+// preloadRecords loads already parsed annotation records (from --annotations
+// or a history entry) into the store, dropping the ones the current diff
+// cannot place.
+func preloadRecords(records []annot.Annotation, store *annot.Store, source tui.DiffSource, ref string, staged bool,
+	untrackedFn func() ([]string, error), untrackedRenamesFn func([]string) ([]git.FileEntry, error),
+	workDir string, warnOut io.Writer,
+) error {
+	p := &preloader{
+		store:              store,
+		source:             source,
+		ref:                ref,
+		staged:             staged,
+		untrackedFn:        untrackedFn,
+		untrackedRenamesFn: untrackedRenamesFn,
+		workDir:            workDir,
+		warnOut:            warnOut,
+		lineCache:          make(map[string]map[lineKey]struct{}),
+		renames:            make(map[string]string),
+	}
+	return p.load(records)
+}
+
+// readAnnotationsFile rejects non-regular files (FIFO, device, anything that
+// would block os.Open) and oversize inputs before parsing. The size guard
+// runs first against info.Size() so we never start scanning a 100 MiB file
+// just to reject it. io.LimitReader is layered on top as belt-and-braces in
+// case the file grows between Stat and Open.
+func readAnnotationsFile(path string) ([]annot.Annotation, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("open annotations file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("open annotations file: %s: not a regular file", path)
+	}
+	if info.Size() > maxAnnotationsFileSize {
+		return nil, fmt.Errorf("annotations file %s exceeds %d bytes (got %d)", path, maxAnnotationsFileSize, info.Size())
+	}
+	f, err := os.Open(path) //nolint:gosec // user-supplied path is intentional
+	if err != nil {
+		return nil, fmt.Errorf("open annotations file: %w", err)
+	}
+	defer f.Close()
+
+	records, err := annot.Parse(io.LimitReader(f, maxAnnotationsFileSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("parse annotations: %w", err)
+	}
+	return records, nil
+}
+
+func (p *preloader) load(records []annot.Annotation) error {
+	known, err := p.resolveKnownFiles()
+	if err != nil {
+		return err
+	}
+
+	for _, a := range records {
+		// Sanitize the comment text before it reaches Store.Add: the
+		// preload source is user- or LLM-supplied and may carry stray
+		// ANSI / CR-overwrite / C1 bytes that style.Renderer.AnnotationInline
+		// wraps into the TUI verbatim. Mirrors git.SanitizeCommitText
+		// usage on commit Author/Subject/Body.
+		a.Comment = git.SanitizeCommitText(a.Comment)
+
+		status, ok := known[a.File]
+		if !ok {
+			p.warnf("warning: --annotations: file %q not in diff, dropping annotation\n", a.File)
+			continue
+		}
+		if a.Line == 0 {
+			p.store.Add(a)
+			continue
+		}
+		lines := p.lookupLineSet(a.File, status)
+		if _, ok := lines[lineKey{line: a.Line, kind: a.Type}]; !ok {
+			p.warnf("warning: --annotations: %s:%d (%s) not in diff, dropping\n", a.File, a.Line, a.Type)
+			continue
+		}
+		p.store.Add(a)
+	}
+	return nil
+}
+
+// resolveKnownFiles returns the paths the preload accepts: the visible file
+// set of the session, plus untracked files regardless of the show-untracked
+// toggle, plus the staged-only additions the UI falls back to when the
+// unstaged set is empty. A file renamed since the annotations were written is
+// keyed under its old path and drops out as an orphan.
+func (p *preloader) resolveKnownFiles() (map[string]git.ChangeStatus, error) {
+	files, err := p.source.ChangedFiles(p.ref, p.staged)
+	if err != nil {
+		return nil, fmt.Errorf("resolve diff for annotation preload: %w", err)
+	}
+	known := make(map[string]git.ChangeStatus, len(files))
+	for _, fe := range files {
+		known[fe.Path] = fe.Status
+		if fe.OldPath != "" {
+			p.renames[fe.Path] = fe.OldPath
+		}
+	}
+	if p.untrackedFn != nil {
+		if ut, utErr := p.untrackedFn(); utErr != nil {
+			p.warnf("warning: --annotations: list untracked files: %v\n", utErr)
+		} else {
+			for _, path := range ut {
+				if _, ok := known[path]; !ok {
+					known[path] = git.FileUntracked
+				}
+			}
+			p.foldUntrackedRenames(ut, known)
+		}
+	}
+	if p.ref != "" || p.staged || len(files) > 0 {
+		return known, nil
+	}
+	stagedFiles, sErr := p.source.ChangedFiles("", true)
+	if sErr != nil {
+		p.warnf("warning: --annotations: resolve staged files: %v\n", sErr)
+		return known, nil
+	}
+	for _, fe := range stagedFiles {
+		if _, ok := known[fe.Path]; ok {
+			continue
+		}
+		if fe.Status == git.FileAdded {
+			known[fe.Path] = fe.Status
+		}
+	}
+	return known, nil
+}
+
+// foldUntrackedRenames upgrades untracked files that are actually working-tree
+// renames (plain `mv old new`, new still untracked) to FileRenamed, records the
+// rename origin in p.renames, and drops the standalone deletion of the origin.
+// This mirrors ui.detectUntrackedRenames + mergeUntrackedEntries so the preload's
+// per-file diff matches the displayed rename-aware diff and annotations on removed
+// or context lines round-trip. No-op unless a git detector is wired and the review
+// is in unstaged working-tree mode (the only mode where new stays untracked).
+func (p *preloader) foldUntrackedRenames(untracked []string, known map[string]git.ChangeStatus) {
+	if p.untrackedRenamesFn == nil || p.ref != "" || p.staged {
+		return
+	}
+	renames, err := p.untrackedRenamesFn(untracked)
+	if err != nil {
+		p.warnf("warning: --annotations: detect untracked renames: %v\n", err)
+		return
+	}
+	for _, r := range renames {
+		known[r.Path] = git.FileRenamed
+		p.renames[r.Path] = r.OldPath
+		delete(known, r.OldPath)
+	}
+}
+
+// lookupLineSet returns the cached line-set for file, fetching FileDiff on
+// miss. Mirrors ui.resolveEmptyDiff: staged-only FileAdded entries retry with
+// --cached when the request was unstaged, and FileUntracked entries are read
+// from disk as all-added lines. Renamed files carry OldPath so the diff is
+// rename-aware and its line keys match the displayed minimal diff.
+func (p *preloader) lookupLineSet(file string, status git.ChangeStatus) map[lineKey]struct{} {
+	if lines, ok := p.lineCache[file]; ok {
+		return lines
+	}
+	var (
+		dl   []git.DiffLine
+		err  error
+		used string
+	)
+	switch {
+	case status == git.FileUntracked && p.workDir != "":
+		used = "read"
+		dl, err = git.ReadFileAsAdded(filepath.Join(p.workDir, file))
+	default:
+		used = "diff"
+		fileStaged := p.staged
+		if !p.staged && p.ref == "" && status == git.FileAdded {
+			fileStaged = true
+		}
+		dl, err = p.source.FileDiff(git.FileDiffRequest{Ref: p.ref, Path: file, OldPath: p.renames[file], Staged: fileStaged})
+	}
+	var lines map[lineKey]struct{}
+	if err != nil {
+		p.warnf("warning: --annotations: %s diff for %q: %v\n", used, file, err)
+		lines = map[lineKey]struct{}{}
+	} else {
+		lines = buildLineSet(dl)
+	}
+	p.lineCache[file] = lines
+	return lines
+}
+
+func (p *preloader) warnf(format string, args ...any) {
+	_, _ = fmt.Fprintf(p.warnOut, format, args...)
+}
+
+// buildLineSet maps each renderable diff line to its (line-number, change-type)
+// key. Mirrors Model.diffLineNum: removals key on OldNum, all other change
+// types key on NewNum.
+func buildLineSet(lines []git.DiffLine) map[lineKey]struct{} {
+	out := make(map[lineKey]struct{}, len(lines))
+	for _, dl := range lines {
+		if dl.ChangeType == git.ChangeDivider {
+			continue
+		}
+		var n int
+		switch dl.ChangeType {
+		case git.ChangeRemove:
+			n = dl.OldNum
+		default:
+			n = dl.NewNum
+		}
+		if n == 0 {
+			continue
+		}
+		out[lineKey{line: n, kind: string(dl.ChangeType)}] = struct{}{}
+	}
+	return out
+}

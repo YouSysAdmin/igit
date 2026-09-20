@@ -1,0 +1,271 @@
+// Package extcmd prepares external processes launched from the TUI: the $EDITOR
+// for annotation text and source files.
+package extcmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+)
+
+// Editor bundles external-editor operations.
+type Editor struct {
+	// Dir is the working directory the editor process starts in, normally the
+	// repository root. Without it the editor inherits igit's own directory,
+	// and an editor that reads its cwd on startup dies when that directory is
+	// gone, which happens whenever the tree is replaced while igit runs.
+	Dir string
+}
+
+// start returns cmd with the editor's working directory applied.
+func (e Editor) start(cmd *exec.Cmd) *exec.Cmd {
+	cmd.Dir = e.Dir
+	return cmd
+}
+
+var (
+	// ErrSourceMissing is returned when SourceCommand cannot find the source file.
+	ErrSourceMissing = errors.New("source file is missing")
+
+	// ErrSourceNotRegular is returned when SourceCommand is given a non-file path.
+	ErrSourceNotRegular = errors.New("source path is not a regular file")
+)
+
+// Command prepares the editor invocation for content. It writes content to a
+// freshly-created temp file and resolves the editor command, returning a ready
+// *exec.Cmd plus a complete function. The caller hands the Cmd to
+// tea.ExecProcess (or runs it directly) and invokes complete(runErr) from the
+// completion callback - complete reads the file back, removes it, and returns
+// the content (trailing newlines trimmed) plus any error. A non-nil runErr is
+// preserved on the returned err even if the file reads successfully.
+func (e Editor) Command(content string) (*exec.Cmd, func(error) (string, error), error) {
+	tempPath, err := e.writeTempFile(content)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	argv := e.resolve()
+	//nolint:gosec // user-controlled editor binary by design (resolved from $EDITOR/$VISUAL)
+	cmd := e.start(exec.CommandContext(context.Background(), argv[0], append(argv[1:], tempPath)...))
+
+	complete := func(runErr error) (string, error) {
+		return e.readResult(tempPath, runErr)
+	}
+	return cmd, complete, nil
+}
+
+// SourceCommand prepares an editor invocation for an existing source file.
+// Known editors receive best-effort line-navigation arguments. unknown editors
+// receive only the path so the command remains shell-free and predictable.
+func (e Editor) SourceCommand(path string, line int) (*exec.Cmd, error) {
+	if path == "" {
+		return nil, ErrSourceMissing
+	}
+	stat, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrSourceMissing
+		}
+		return nil, fmt.Errorf("stat source file: %w", err)
+	}
+	if !stat.Mode().IsRegular() {
+		return nil, ErrSourceNotRegular
+	}
+	argv := e.resolve()
+	mode := editorLineSyntax(argv[0])
+	switch mode {
+	case editorPlusLine:
+		if line > 0 {
+			argv = append(argv, "+"+strconv.Itoa(line))
+		}
+		argv = append(argv, path)
+	case editorGotoLine:
+		if line > 0 {
+			argv = append(argv, "--goto", path+":"+strconv.Itoa(line))
+		} else {
+			argv = append(argv, path)
+		}
+	case editorPlainLine:
+		argv = append(argv, path)
+	default:
+		// editorLineMode values come from private code in this file. An
+		// unrecognized mode means SourceCommand and editorLineSyntax disagree.
+		// callers cannot fix it by changing their input.
+		panic(fmt.Sprintf("unrecognized editor line mode %d", mode))
+	}
+	//nolint:gosec // user-controlled editor binary by design (resolved from $EDITOR/$VISUAL)
+	return e.start(exec.CommandContext(context.Background(), argv[0], argv[1:]...)), nil
+}
+
+// editorLineMode describes how an editor accepts an initial source line.
+type editorLineMode int
+
+const (
+	// editorPlainLine opens the path without a line-navigation argument.
+	editorPlainLine editorLineMode = iota
+
+	// editorPlusLine uses "+N" before the path, as vi-family editors do.
+	editorPlusLine
+
+	// editorGotoLine uses "--goto path:N", as VS Code-family editors do.
+	editorGotoLine
+)
+
+func editorLineSyntax(program string) editorLineMode {
+	switch filepath.Base(program) {
+	case "vi", "vim", "nvim", "nano":
+		return editorPlusLine
+	case "code", "code-insiders", "codium", "cursor":
+		return editorGotoLine
+	default:
+		return editorPlainLine
+	}
+}
+
+// resolve returns the editor command and its arguments. Lookup order is
+// $EDITOR -> $VISUAL -> "vi". Tokenization respects POSIX-style quoting so
+// values like `code --wait`, `"/Applications/My Editor.app/Contents/MacOS/Edit" --wait`,
+// or `sh -c 'vim "$@"' --` work as expected. Falls back to whitespace splitting
+// when the input contains no quote characters.
+func (e Editor) resolve() []string {
+	for _, env := range []string{"EDITOR", "VISUAL"} {
+		v := strings.TrimSpace(os.Getenv(env))
+		if v == "" {
+			continue
+		}
+		if tokens := e.tokenize(v); len(tokens) > 0 {
+			return tokens
+		}
+	}
+	return []string{"vi"}
+}
+
+// shellMetaChars are the runes whose shell significance backslash can escape
+// outside quotes (POSIX-style). Other characters - notably Windows-style path
+// separators in `C:\foo` - preserve the backslash literally.
+var shellMetaChars = map[rune]bool{
+	' ': true, '\t': true, '\n': true,
+	'\'': true, '"': true, '\\': true, '$': true, '`': true,
+}
+
+// tokenize splits s into shell-style tokens honoring single and double quotes
+// and backslash escapes. Outside quotes, backslash only escapes shell-meta
+// characters - other characters preserve the backslash intact so paths like
+// `C:\Program Files` survive. Unterminated quotes are treated as literal from
+// the opening quote to end-of-string so a misquoted $EDITOR never drops user
+// input. Not a full shell parser - variable expansion, subshells, and
+// redirection are not interpreted. those are caller-supplied values handled
+// by exec directly.
+func (e Editor) tokenize(s string) []string {
+	var tokens []string
+	var cur strings.Builder
+	inSingle, inDouble, hasToken := false, false, false
+	flush := func() {
+		if hasToken {
+			tokens = append(tokens, cur.String())
+			cur.Reset()
+			hasToken = false
+		}
+	}
+	runes := []rune(s)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		consumed, open := e.tokenizeStep(runes, i, r, &cur, &hasToken, inSingle, inDouble)
+		i += consumed
+		inSingle, inDouble = open.single, open.double
+		if open.flush {
+			flush()
+		}
+	}
+	flush()
+	return tokens
+}
+
+type quoteState struct {
+	single, double, flush bool
+}
+
+// tokenizeStep processes one input rune. Returns the additional runes consumed
+// (for escape sequences) and the updated quote state plus a flush signal.
+func (Editor) tokenizeStep(runes []rune, i int, r rune, cur *strings.Builder, hasToken *bool, inSingle, inDouble bool) (int, quoteState) {
+	state := quoteState{single: inSingle, double: inDouble}
+	switch {
+	case inSingle:
+		if r == '\'' {
+			state.single = false
+			return 0, state
+		}
+		cur.WriteRune(r)
+		*hasToken = true
+	case inDouble:
+		if r == '"' {
+			state.double = false
+			return 0, state
+		}
+		if r == '\\' && i+1 < len(runes) {
+			next := runes[i+1]
+			if next == '"' || next == '\\' || next == '$' || next == '`' {
+				cur.WriteRune(next)
+				*hasToken = true
+				return 1, state
+			}
+		}
+		cur.WriteRune(r)
+		*hasToken = true
+	case r == '\'':
+		state.single = true
+		*hasToken = true
+	case r == '"':
+		state.double = true
+		*hasToken = true
+	case r == '\\' && i+1 < len(runes) && shellMetaChars[runes[i+1]]:
+		cur.WriteRune(runes[i+1])
+		*hasToken = true
+		return 1, state
+	case r == ' ' || r == '\t' || r == '\n':
+		state.flush = true
+	default:
+		cur.WriteRune(r)
+		*hasToken = true
+	}
+	return 0, state
+}
+
+// writeTempFile creates a new temp file with a .md suffix and writes content
+// into it. The returned path is paired with readResult which removes the file.
+func (Editor) writeTempFile(content string) (string, error) {
+	f, err := os.CreateTemp("", "igit-annot-*.md")
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return "", fmt.Errorf("write temp file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return "", fmt.Errorf("close temp file: %w", err)
+	}
+	return f.Name(), nil
+}
+
+// readResult reads the temp file and returns its content (trailing newlines
+// trimmed) plus any error, removing the file regardless of outcome. A non-nil
+// runErr takes precedence - read errors only surface when runErr is nil.
+func (Editor) readResult(tempPath string, runErr error) (string, error) {
+	data, readErr := os.ReadFile(tempPath) //nolint:gosec // tempPath produced by writeTempFile
+	_ = os.Remove(tempPath)
+	if runErr != nil {
+		return strings.TrimRight(string(data), "\n"), runErr
+	}
+	if readErr != nil {
+		return "", fmt.Errorf("read editor output: %w", readErr)
+	}
+	return strings.TrimRight(string(data), "\n"), nil
+}

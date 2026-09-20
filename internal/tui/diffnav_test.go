@@ -1,0 +1,3742 @@
+package tui
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/yousysadmin/igit/internal/annot"
+	"github.com/yousysadmin/igit/internal/git"
+	"github.com/yousysadmin/igit/internal/keymap"
+	"github.com/yousysadmin/igit/internal/tui/sidepane"
+)
+
+func TestModel_NextPrevFile(t *testing.T) {
+	files := []string{"a.go", "b.go", "c.go"}
+	m := testModel(files, map[string][]git.DiffLine{
+		"a.go": {{NewNum: 1, Content: "a", ChangeType: git.ChangeContext}},
+		"b.go": {{NewNum: 1, Content: "b", ChangeType: git.ChangeContext}},
+		"c.go": {{NewNum: 1, Content: "c", ChangeType: git.ChangeContext}},
+	})
+	m.tree = testNewFileTree(files)
+	m.file.name = "a.go" // pretend first file is already loaded
+
+	// starts on first file (a.go)
+	assert.Equal(t, "a.go", m.tree.SelectedFile())
+
+	// press n - should move to b.go
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	model := result.(Model)
+	assert.Equal(t, "b.go", model.tree.SelectedFile())
+	assert.NotNil(t, cmd) // triggers file load
+
+	// press n - should move to c.go
+	result, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	model = result.(Model)
+	assert.Equal(t, "c.go", model.tree.SelectedFile())
+	assert.NotNil(t, cmd)
+
+	// press p - back to b.go
+	result, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	model = result.(Model)
+	assert.Equal(t, "b.go", model.tree.SelectedFile())
+	assert.NotNil(t, cmd)
+}
+func TestModel_DiffScrolling(t *testing.T) {
+	lines := make([]git.DiffLine, 100)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	m.tree = testNewFileTree([]string{"a.go"})
+	m.layout.focus = paneDiff
+
+	// load file
+	result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model := result.(Model)
+	assert.Equal(t, 0, model.nav.diffCursor)
+
+	// j moves cursor down
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	model = result.(Model)
+	assert.Equal(t, 1, model.nav.diffCursor)
+
+	// k moves cursor back up
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model = result.(Model)
+	assert.Equal(t, 0, model.nav.diffCursor)
+}
+func TestModel_DiffCursorSkipsDividers(t *testing.T) {
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "line1", ChangeType: git.ChangeContext},
+		{Content: "...", ChangeType: git.ChangeDivider},
+		{NewNum: 10, Content: "line10", ChangeType: git.ChangeContext},
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	m.tree = testNewFileTree([]string{"a.go"})
+	m.layout.focus = paneDiff
+
+	result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model := result.(Model)
+	assert.Equal(t, 0, model.nav.diffCursor)
+
+	// j should skip divider and land on line10
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	model = result.(Model)
+	assert.Equal(t, 2, model.nav.diffCursor)
+
+	// k should skip divider and go back to line1
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	model = result.(Model)
+	assert.Equal(t, 0, model.nav.diffCursor)
+}
+func TestModel_DiffCursorAutoScrolls(t *testing.T) {
+	// create more lines than viewport height
+	lines := make([]git.DiffLine, 100)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	m.tree = testNewFileTree([]string{"a.go"})
+	m.layout.focus = paneDiff
+
+	result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model := result.(Model)
+
+	// move cursor past viewport height - viewport should auto-scroll
+	for range 50 {
+		result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		model = result.(Model)
+	}
+	assert.Equal(t, 50, model.nav.diffCursor)
+	assert.Positive(t, model.layout.viewport.YOffset, "viewport should have scrolled")
+}
+func TestModel_CursorDiffLine(t *testing.T) {
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "line1", ChangeType: git.ChangeContext},
+		{NewNum: 2, Content: "added", ChangeType: git.ChangeAdd},
+	}
+	m := testModel(nil, nil)
+	m.file.lines = lines
+	m.nav.diffCursor = 0
+
+	dl, ok := m.cursorDiffLine()
+	assert.True(t, ok)
+	assert.Equal(t, "line1", dl.Content)
+	assert.Equal(t, git.ChangeContext, dl.ChangeType)
+
+	m.nav.diffCursor = 1
+	dl, ok = m.cursorDiffLine()
+	assert.True(t, ok)
+	assert.Equal(t, "added", dl.Content)
+	assert.Equal(t, git.ChangeAdd, dl.ChangeType)
+
+	// out of bounds
+	m.nav.diffCursor = -1
+	_, ok = m.cursorDiffLine()
+	assert.False(t, ok)
+
+	m.nav.diffCursor = 10
+	_, ok = m.cursorDiffLine()
+	assert.False(t, ok)
+}
+func TestModel_HunkEndLine(t *testing.T) {
+	lines := []git.DiffLine{
+		{OldNum: 1, NewNum: 1, Content: "ctx", ChangeType: git.ChangeContext},
+		{OldNum: 2, Content: "removed", ChangeType: git.ChangeRemove},
+		{NewNum: 2, Content: "added1", ChangeType: git.ChangeAdd},
+		{NewNum: 3, Content: "added2", ChangeType: git.ChangeAdd},
+		{OldNum: 3, NewNum: 4, Content: "ctx", ChangeType: git.ChangeContext},
+	}
+	m := testModel(nil, nil)
+	m.file.lines = lines
+
+	t.Run("remove line stops at same type boundary", func(t *testing.T) {
+		assert.Equal(t, 2, m.hunkEndLine(1), "single remove stays in old-file number space")
+	})
+	t.Run("add line walks through consecutive adds", func(t *testing.T) {
+		assert.Equal(t, 3, m.hunkEndLine(2), "two adds, last NewNum=3")
+	})
+	t.Run("returns last line from last change line", func(t *testing.T) {
+		assert.Equal(t, 3, m.hunkEndLine(3))
+	})
+	t.Run("returns 0 for context line", func(t *testing.T) {
+		assert.Equal(t, 0, m.hunkEndLine(0))
+	})
+	t.Run("returns 0 for out of bounds", func(t *testing.T) {
+		assert.Equal(t, 0, m.hunkEndLine(-1))
+		assert.Equal(t, 0, m.hunkEndLine(99))
+	})
+
+	t.Run("mixed hunk removes followed by adds", func(t *testing.T) {
+		// simulates a real diff where 3 lines are removed and 2 added
+		mixedLines := []git.DiffLine{
+			{OldNum: 10, NewNum: 10, Content: "ctx", ChangeType: git.ChangeContext},
+			{OldNum: 11, Content: "old line 1", ChangeType: git.ChangeRemove},
+			{OldNum: 12, Content: "old line 2", ChangeType: git.ChangeRemove},
+			{OldNum: 13, Content: "old line 3", ChangeType: git.ChangeRemove},
+			{NewNum: 11, Content: "new line 1", ChangeType: git.ChangeAdd},
+			{NewNum: 12, Content: "new line 2", ChangeType: git.ChangeAdd},
+			{OldNum: 14, NewNum: 13, Content: "ctx", ChangeType: git.ChangeContext},
+		}
+		m.file.lines = mixedLines
+
+		// cursor on first remove: end should be last remove (OldNum=13), not any add line
+		assert.Equal(t, 13, m.hunkEndLine(1), "remove hunk end stays in old-file space")
+		// cursor on middle remove
+		assert.Equal(t, 13, m.hunkEndLine(2), "middle remove walks to last remove")
+		// cursor on last remove
+		assert.Equal(t, 13, m.hunkEndLine(3), "last remove returns own OldNum")
+
+		// cursor on first add: end should be last add (NewNum=12), not a remove
+		assert.Equal(t, 12, m.hunkEndLine(4), "add hunk end stays in new-file space")
+		// cursor on last add
+		assert.Equal(t, 12, m.hunkEndLine(5), "last add returns own NewNum")
+	})
+}
+func TestModel_CursorViewportY(t *testing.T) {
+	m := testModel(nil, nil)
+	m.file.name = "a.go"
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, Content: "line1", ChangeType: git.ChangeContext},
+		{NewNum: 2, Content: "line2", ChangeType: git.ChangeAdd},
+		{NewNum: 3, Content: "line3", ChangeType: git.ChangeContext},
+	}
+
+	// no annotations, cursor at 0 -> viewport Y = 0
+	m.nav.diffCursor = 0
+	assert.Equal(t, 0, m.cursorViewportY())
+
+	// no annotations, cursor at 2 -> viewport Y = 2
+	m.nav.diffCursor = 2
+	assert.Equal(t, 2, m.cursorViewportY())
+
+	// add annotation on line 1 (index 0), cursor at 2 -> viewport Y = 3 (line0 + annotation + line1)
+	m.store.Add(annot.Annotation{File: "a.go", Line: 1, Type: " ", Comment: "comment"})
+	m.nav.diffCursor = 2
+	assert.Equal(t, 3, m.cursorViewportY())
+
+	// empty file with non-zero cursor returns cursor value directly
+	empty := testModel(nil, nil)
+	empty.nav.diffCursor = 5
+	assert.Equal(t, 5, empty.cursorViewportY(), "empty state returns diffCursor as-is")
+}
+func TestModel_NextPrevFileWrapAround(t *testing.T) {
+	files := []string{"a.go", "b.go"}
+	m := testModel(files, map[string][]git.DiffLine{
+		"a.go": {{NewNum: 1, Content: "a", ChangeType: git.ChangeContext}},
+		"b.go": {{NewNum: 1, Content: "b", ChangeType: git.ChangeContext}},
+	})
+	m.tree = testNewFileTree(files)
+	m.file.name = "a.go"
+
+	// move to last file
+	m.tree.StepFile(sidepane.DirectionNext)
+	assert.Equal(t, "b.go", m.tree.SelectedFile())
+	m.file.name = "b.go"
+
+	// n should wrap to first
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	model := result.(Model)
+	assert.Equal(t, "a.go", model.tree.SelectedFile())
+
+	// p should wrap to last
+	model.file.name = "a.go"
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	model = result.(Model)
+	assert.Equal(t, "b.go", model.tree.SelectedFile())
+}
+func TestModel_PgDownMovesCursorByPageHeight(t *testing.T) {
+	lines := make([]git.DiffLine, 100)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+
+	// initialize viewport via resize so Height is set
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+
+	// load file
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	assert.Equal(t, 0, model.nav.diffCursor)
+
+	pageHeight := model.layout.viewport.Height
+	require.Positive(t, pageHeight, "viewport height must be positive")
+
+	// pgdown should move cursor by page height
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model = result.(Model)
+	assert.Equal(t, pageHeight, model.nav.diffCursor, "PgDown should move cursor by viewport height")
+
+	// ctrl+d should move by half page height from current position
+	prevCursor := model.nav.diffCursor
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	model = result.(Model)
+	halfPage := pageHeight / 2
+	assert.Equal(t, prevCursor+halfPage, model.nav.diffCursor, "ctrl+d should move cursor by half viewport height")
+}
+func TestModel_PgUpMovesCursorByPageHeight(t *testing.T) {
+	lines := make([]git.DiffLine, 100)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+
+	// initialize viewport via resize so Height is set
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+
+	// load file
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	pageHeight := model.layout.viewport.Height
+	require.Positive(t, pageHeight, "viewport height must be positive")
+
+	// move cursor to line 80 first
+	model.nav.diffCursor = 80
+
+	// pgup should move cursor up by page height
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	model = result.(Model)
+	assert.Equal(t, 80-pageHeight, model.nav.diffCursor, "PgUp should move cursor up by viewport height")
+
+	// ctrl+u should move up by half page height
+	model.nav.diffCursor = 80
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	model = result.(Model)
+	halfPage := pageHeight / 2
+	assert.Equal(t, 80-halfPage, model.nav.diffCursor, "ctrl+u should move cursor up by half viewport height")
+}
+func TestModel_CtrlDMovesHalfPageDown(t *testing.T) {
+	lines := make([]git.DiffLine, 100)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	assert.Equal(t, 0, model.nav.diffCursor)
+
+	pageHeight := model.layout.viewport.Height
+	halfPage := pageHeight / 2
+	require.Positive(t, halfPage, "half page must be positive")
+
+	// ctrl+d moves cursor and viewport by half page
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	model = result.(Model)
+	assert.Equal(t, halfPage, model.nav.diffCursor, "ctrl+d should move cursor by half viewport height")
+	assert.Equal(t, halfPage, model.layout.viewport.YOffset, "ctrl+d should scroll viewport by half page")
+
+	// PgDn moves full page from start for comparison
+	model.nav.diffCursor = 0
+	model.layout.viewport.SetYOffset(0)
+	model.layout.viewport.SetContent(model.renderDiff())
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model = result.(Model)
+	assert.Equal(t, pageHeight, model.nav.diffCursor, "PgDown should move cursor by full viewport height")
+}
+func TestModel_CtrlUMovesHalfPageUp(t *testing.T) {
+	lines := make([]git.DiffLine, 100)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	pageHeight := model.layout.viewport.Height
+	halfPage := pageHeight / 2
+	require.Positive(t, halfPage, "half page must be positive")
+
+	// start at line 80 with viewport scrolled to match
+	model.nav.diffCursor = 80
+	model.layout.viewport.SetYOffset(80)
+	model.layout.viewport.SetContent(model.renderDiff())
+	prevOffset := model.layout.viewport.YOffset
+
+	// ctrl+u moves cursor and viewport by half page up
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	model = result.(Model)
+	assert.Equal(t, 80-halfPage, model.nav.diffCursor, "ctrl+u should move cursor up by half viewport height")
+	assert.Equal(t, prevOffset-halfPage, model.layout.viewport.YOffset, "ctrl+u should scroll viewport up by half page")
+
+	// PgUp moves full page up from 80 for comparison
+	model.nav.diffCursor = 80
+	model.layout.viewport.SetYOffset(80)
+	model.layout.viewport.SetContent(model.renderDiff())
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	model = result.(Model)
+	assert.Equal(t, 80-pageHeight, model.nav.diffCursor, "PgUp should move cursor up by full viewport height")
+}
+
+// pgdown/pgup must keep the cursor's on-screen row stable - same relative position
+// before and after. symmetric to ctrl+d/ctrl+u.
+func TestModel_PgDownPgUpPreservesRelativeCursorPosition(t *testing.T) {
+	makeModel := func() Model {
+		lines := make([]git.DiffLine, 200)
+		for i := range lines {
+			lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+		}
+		m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+		result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		model := result.(Model)
+		result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+		model = result.(Model)
+		model.layout.focus = paneDiff
+		return model
+	}
+
+	t.Run("from top, pgdown then pgup is reversible", func(t *testing.T) {
+		model := makeModel()
+		pageHeight := model.layout.viewport.Height
+		require.Positive(t, pageHeight, "page height must be positive")
+		require.Equal(t, 0, model.nav.diffCursor, "cursor starts at 0")
+		require.Equal(t, 0, model.layout.viewport.YOffset, "viewport starts at 0")
+
+		result, _ := model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		model = result.(Model)
+		assert.Equal(t, 0, model.cursorViewportY()-model.layout.viewport.YOffset,
+			"pgdown from top should keep cursor at screen row 0")
+		assert.Equal(t, pageHeight, model.nav.diffCursor, "pgdown should advance cursor by page height")
+		assert.Equal(t, pageHeight, model.layout.viewport.YOffset, "pgdown should scroll viewport by page height")
+
+		result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+		model = result.(Model)
+		assert.Equal(t, 0, model.nav.diffCursor, "pgup should reverse pgdown exactly")
+		assert.Equal(t, 0, model.layout.viewport.YOffset, "pgup should restore viewport offset")
+	})
+
+	t.Run("cursor at mid-screen row stays at mid-screen after pgdown", func(t *testing.T) {
+		model := makeModel()
+		// move cursor down 5 rows so it is NOT at screen row 0
+		for range 5 {
+			model.moveDiffCursorDown()
+		}
+		midScreenRow := model.cursorViewportY() - model.layout.viewport.YOffset
+		require.Equal(t, 5, midScreenRow, "setup: cursor should be at screen row 5")
+
+		result, _ := model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		model = result.(Model)
+		assert.Equal(t, midScreenRow, model.cursorViewportY()-model.layout.viewport.YOffset,
+			"pgdown should preserve cursor's on-screen row (not snap to top)")
+
+		result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+		model = result.(Model)
+		assert.Equal(t, midScreenRow, model.cursorViewportY()-model.layout.viewport.YOffset,
+			"pgup should preserve cursor's on-screen row (not snap to bottom)")
+	})
+
+	t.Run("pgdown+pgdown+pgup returns to after-first-pgdown state", func(t *testing.T) {
+		model := makeModel()
+
+		result, _ := model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		model = result.(Model)
+		afterFirstPgDownCursor := model.nav.diffCursor
+		afterFirstPgDownOffset := model.layout.viewport.YOffset
+
+		result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		model = result.(Model)
+
+		result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+		model = result.(Model)
+		assert.Equal(t, afterFirstPgDownCursor, model.nav.diffCursor,
+			"pgdown+pgdown+pgup should return cursor to after-first-pgdown state")
+		assert.Equal(t, afterFirstPgDownOffset, model.layout.viewport.YOffset,
+			"pgdown+pgdown+pgup should return viewport to after-first-pgdown state")
+	})
+
+	t.Run("wrap mode with long lines preserves cursor on-screen row", func(t *testing.T) {
+		// mix short and long lines so some wrap and cursorViewportY math spans multiple rows per line
+		longLine := strings.Repeat("abcdefghij ", 20) // ~220 chars, forces wrap
+		lines := make([]git.DiffLine, 100)
+		for i := range lines {
+			content := "short"
+			if i%3 == 0 {
+				content = longLine
+			}
+			lines[i] = git.DiffLine{NewNum: i + 1, Content: content, ChangeType: git.ChangeContext}
+		}
+		m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+		result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		model := result.(Model)
+		result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+		model = result.(Model)
+		model.layout.focus = paneDiff
+		model.modes.wrap = true
+		model.layout.viewport.SetContent(model.renderDiff())
+
+		// move cursor down 3 rows so it is mid-screen (over wrapped and short lines)
+		for range 3 {
+			model.moveDiffCursorDown()
+		}
+		midScreenRow := model.cursorViewportY() - model.layout.viewport.YOffset
+
+		result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		model = result.(Model)
+		assert.Equal(t, midScreenRow, model.cursorViewportY()-model.layout.viewport.YOffset,
+			"wrap-mode pgdown should preserve cursor's on-screen row")
+
+		result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+		model = result.(Model)
+		assert.Equal(t, midScreenRow, model.cursorViewportY()-model.layout.viewport.YOffset,
+			"wrap-mode pgup should preserve cursor's on-screen row")
+	})
+}
+
+func TestModel_PageOverlapCarriesRowsAcrossPages(t *testing.T) {
+	lines := make([]git.DiffLine, 200)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeAdd}
+	}
+
+	newModel := func(overlap int) Model {
+		m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+		m.modes.pageOverlap = overlap
+		result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+		model := result.(Model)
+		result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+		model = result.(Model)
+		model.layout.focus = paneDiff
+		return model
+	}
+
+	t.Run("zero overlap advances a full page", func(t *testing.T) {
+		model := newModel(0)
+		pageHeight := model.layout.viewport.Height
+		result, _ := model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		model = result.(Model)
+		assert.Equal(t, pageHeight, model.layout.viewport.YOffset)
+	})
+
+	t.Run("overlap keeps N rows on screen", func(t *testing.T) {
+		model := newModel(2)
+		pageHeight := model.layout.viewport.Height
+		result, _ := model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		model = result.(Model)
+		assert.Equal(t, pageHeight-2, model.layout.viewport.YOffset,
+			"the last 2 rows of the previous screen must be the first 2 of the new one")
+	})
+
+	t.Run("overlap applies to pgup as well", func(t *testing.T) {
+		model := newModel(2)
+		pageHeight := model.layout.viewport.Height
+		for range 2 {
+			result, _ := model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+			model = result.(Model)
+		}
+		downOffset := model.layout.viewport.YOffset
+		result, _ := model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+		model = result.(Model)
+		assert.Equal(t, downOffset-(pageHeight-2), model.layout.viewport.YOffset)
+	})
+
+	t.Run("half page motions ignore the overlap", func(t *testing.T) {
+		model := newModel(2)
+		pageHeight := model.layout.viewport.Height
+		result, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+		model = result.(Model)
+		assert.Equal(t, pageHeight/2, model.layout.viewport.YOffset,
+			"ctrl+d already retains half a screen, so the overlap must not shrink it further")
+	})
+
+	t.Run("overlap wider than the pane still advances", func(t *testing.T) {
+		model := newModel(1000)
+		result, _ := model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		model = result.(Model)
+		assert.Positive(t, model.layout.viewport.YOffset, "paging must never stall on an oversized overlap")
+	})
+}
+
+// a line taller than the remaining page budget must not make paging scroll past unseen rows:
+// stepping onto it and shifting the viewport by the cursor's whole visual delta would skip
+// the tail of an annotation that was never rendered.
+func TestModel_PagingDoesNotSkipRowsAtTallLineBoundary(t *testing.T) {
+	lines := make([]git.DiffLine, 200)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeAdd}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	pageHeight := model.layout.viewport.Height
+	require.Positive(t, pageHeight)
+
+	// annotate the line one row short of the page edge with a body long enough to wrap
+	// several rows, so stepping off it crosses the page boundary in a single cursor step
+	boundary := pageHeight - 2
+	require.Positive(t, boundary)
+	model.store.Add(annot.Annotation{File: "a.go", Line: boundary + 1, Type: string(git.ChangeAdd),
+		Comment: strings.Repeat("some long annotation body ", 30)})
+	model.invalidateRenderCaches()
+
+	offsets := model.cursorVisualOffsets(model.findHunks(), model.buildAnnotationSet())
+	require.Greater(t, offsets[boundary+1]-offsets[boundary], 3,
+		"annotated line must be tall enough to overshoot the page budget")
+
+	startOffset := model.layout.viewport.YOffset
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model = result.(Model)
+	assert.LessOrEqual(t, model.layout.viewport.YOffset-startOffset, pageHeight,
+		"pgdown must not advance the viewport by more than one page, or rows are skipped unseen")
+	assert.Greater(t, model.layout.viewport.YOffset, startOffset, "pgdown must still advance the viewport")
+
+	downOffset := model.layout.viewport.YOffset
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	model = result.(Model)
+	assert.LessOrEqual(t, downOffset-model.layout.viewport.YOffset, pageHeight,
+		"pgup must not retreat the viewport by more than one page, or rows are skipped unseen")
+}
+
+// a line taller than the whole viewport must stay reachable: the overshoot guard exempts the
+// first step, or paging would refuse to move and the cursor could never get past such a line.
+func TestModel_PagingAdvancesPastLineTallerThanPage(t *testing.T) {
+	lines := make([]git.DiffLine, 200)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeAdd}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	pageHeight := model.layout.viewport.Height
+	model.store.Add(annot.Annotation{File: "a.go", Line: 1, Type: string(git.ChangeAdd),
+		Comment: strings.Repeat("a very long annotation body that wraps many times ", 40)})
+	model.invalidateRenderCaches()
+
+	offsets := model.cursorVisualOffsets(model.findHunks(), model.buildAnnotationSet())
+	require.Greater(t, offsets[1]-offsets[0], pageHeight,
+		"the annotated line must be taller than a full page for this to exercise the exemption")
+
+	startOffset := model.layout.viewport.YOffset
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model = result.(Model)
+	assert.GreaterOrEqual(t, model.layout.viewport.YOffset-startOffset, pageHeight/2,
+		"pgdown must not collapse to a near-zero scroll when the block ahead is taller than the page")
+
+	for range 2 {
+		result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		model = result.(Model)
+	}
+	assert.Positive(t, model.nav.diffCursor, "paging must get past a line taller than the viewport")
+}
+
+// the upward walk rolls back its overshooting step too: without it, pgup across a tall
+// annotated line retreats the viewport by the line's whole height, past rows never rendered.
+func TestModel_PgUpDoesNotSkipRowsAtTallLineBoundary(t *testing.T) {
+	lines := make([]git.DiffLine, 200)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeAdd}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	pageHeight := model.layout.viewport.Height
+	const tall = 40
+	model.store.Add(annot.Annotation{File: "a.go", Line: tall + 1, Type: string(git.ChangeAdd),
+		Comment: strings.Repeat("some long annotation body ", 30)})
+	model.invalidateRenderCaches()
+
+	offsets := model.cursorVisualOffsets(model.findHunks(), model.buildAnnotationSet())
+	require.Greater(t, offsets[tall+1]-offsets[tall], 3,
+		"annotated line must be tall enough to overshoot the page budget")
+
+	// park the cursor just over half a page below the tall line, so the walk up has spent
+	// enough budget to make the rollback worthwhile by the time it reaches the annotation
+	model.nav.diffCursor = tall + pageHeight/2 + 1
+	model.syncViewportToCursor()
+	require.Greater(t, model.layout.viewport.YOffset, pageHeight,
+		"viewport must be far enough down that an over-page retreat would not clamp at zero")
+
+	startOffset := model.layout.viewport.YOffset
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	model = result.(Model)
+	assert.LessOrEqual(t, startOffset-model.layout.viewport.YOffset, pageHeight,
+		"pgup must not retreat the viewport by more than one page, or rows are skipped unseen")
+	assert.Less(t, model.layout.viewport.YOffset, startOffset, "pgup must still retreat the viewport")
+}
+
+// on annotated lines the cursor must stay visible within the viewport after pgdown/pgup,
+// even when moveDiffCursorDown only flips onAnnotationRow without advancing diffCursor.
+func TestModel_PgDownKeepsCursorVisibleOnAnnotatedLine(t *testing.T) {
+	lines := make([]git.DiffLine, 100)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeAdd}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	// annotate the first few lines so that moveDiffCursorDown will stall on onAnnotationRow
+	for i := range 5 {
+		model.store.Add(annot.Annotation{File: "a.go", Line: i + 1, Type: string(git.ChangeAdd), Comment: "note"})
+	}
+
+	pageHeight := model.layout.viewport.Height
+	require.Positive(t, pageHeight)
+
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model = result.(Model)
+
+	cursorY := model.cursorViewportY()
+	yOffset := model.layout.viewport.YOffset
+	assert.GreaterOrEqual(t, cursorY, yOffset,
+		"cursor must stay on or below the top of the viewport after pgdown on annotated line")
+	assert.Less(t, cursorY, yOffset+pageHeight,
+		"cursor must stay above the bottom of the viewport after pgdown on annotated line")
+
+	// pgup must also keep cursor visible
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	model = result.(Model)
+	cursorY = model.cursorViewportY()
+	yOffset = model.layout.viewport.YOffset
+	assert.GreaterOrEqual(t, cursorY, yOffset,
+		"cursor must stay visible after pgup on annotated line")
+	assert.Less(t, cursorY, yOffset+pageHeight,
+		"cursor must stay visible after pgup on annotated line")
+}
+
+func TestModel_TreeCtrlDUMovesHalfPage(t *testing.T) {
+	files := make([]string, 50)
+	for i := range files {
+		files[i] = fmt.Sprintf("pkg/file%02d.go", i)
+	}
+	m := testModel(files, nil)
+	m.tree = testNewFileTree(files)
+	m.layout.focus = paneTree
+	m.layout.height = 20
+
+	pageSize := m.treePageSize()
+	halfPage := max(1, pageSize/2)
+
+	// ctrl+d from start
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	model := result.(Model)
+	assert.Equal(t, fmt.Sprintf("pkg/file%02d.go", halfPage), model.tree.SelectedFile(),
+		"ctrl+d should move by half page")
+
+	// ctrl+u from end area
+	m3 := testModel(files, nil)
+	m3.tree = testNewFileTree(files)
+	m3.layout.focus = paneTree
+	m3.layout.height = 20
+	// move to file 39
+	m3.tree.Move(sidepane.MotionLast)
+	for range 10 {
+		m3.tree.Move(sidepane.MotionUp)
+	}
+	assert.Equal(t, "pkg/file39.go", m3.tree.SelectedFile())
+
+	result, _ = m3.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	model3 := result.(Model)
+	assert.Equal(t, fmt.Sprintf("pkg/file%02d.go", 39-halfPage), model3.tree.SelectedFile(),
+		"ctrl+u should move by half page")
+
+	// PgDn from start should move full page
+	m2 := testModel(files, nil)
+	m2.tree = testNewFileTree(files)
+	m2.layout.focus = paneTree
+	m2.layout.height = 20
+
+	result, _ = m2.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model2 := result.(Model)
+	assert.Equal(t, fmt.Sprintf("pkg/file%02d.go", pageSize), model2.tree.SelectedFile(),
+		"PgDn should move by full page")
+}
+func TestModel_HomeEndMoveCursorToBoundaries(t *testing.T) {
+	lines := make([]git.DiffLine, 50)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+
+	// initialize viewport via resize
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+
+	// load file
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	// move to middle
+	model.nav.diffCursor = 25
+
+	// end should move to last line
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	model = result.(Model)
+	assert.Equal(t, 49, model.nav.diffCursor, "End should move cursor to last line")
+
+	// home should move to first line
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyHome})
+	model = result.(Model)
+	assert.Equal(t, 0, model.nav.diffCursor, "Home should move cursor to first line")
+}
+func TestModel_HomeEndSkipDividers(t *testing.T) {
+	lines := []git.DiffLine{
+		{Content: "...", ChangeType: git.ChangeDivider},
+		{NewNum: 1, Content: "line1", ChangeType: git.ChangeContext},
+		{NewNum: 2, Content: "line2", ChangeType: git.ChangeContext},
+		{Content: "...", ChangeType: git.ChangeDivider},
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+
+	// initialize viewport via resize
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+
+	// load file
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	// home should skip leading divider
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyHome})
+	model = result.(Model)
+	assert.Equal(t, 1, model.nav.diffCursor, "Home should skip leading divider")
+
+	// end should skip trailing divider
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	model = result.(Model)
+	assert.Equal(t, 2, model.nav.diffCursor, "End should skip trailing divider")
+}
+func TestModel_PgDownClampsAtEnd(t *testing.T) {
+	lines := make([]git.DiffLine, 10)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+
+	// initialize viewport via resize
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+
+	// load file - viewport height is much larger than 10 lines
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	// pgdown when there are fewer lines than page height should clamp at last line
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model = result.(Model)
+	assert.Equal(t, 9, model.nav.diffCursor, "PgDown should clamp at last line")
+}
+func TestModel_PgUpClampsAtStart(t *testing.T) {
+	lines := make([]git.DiffLine, 10)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+
+	// initialize viewport via resize
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+
+	// load file
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	model.nav.diffCursor = 3
+
+	// pgup from line 3 with large page height should clamp at first line
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	model = result.(Model)
+	assert.Equal(t, 0, model.nav.diffCursor, "PgUp should clamp at first line")
+}
+func TestModel_PgDownAccountsForDividers(t *testing.T) {
+	// create diff lines with dividers every 5 lines (simulating hunk boundaries)
+	lines := make([]git.DiffLine, 0, 71)
+	for i := range 60 {
+		if i > 0 && i%5 == 0 {
+			lines = append(lines, git.DiffLine{Content: "@@ hunk @@", ChangeType: git.ChangeDivider})
+		}
+		lines = append(lines, git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext})
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	assert.Equal(t, 0, model.nav.diffCursor)
+
+	pageHeight := model.layout.viewport.Height
+	require.Positive(t, pageHeight)
+
+	// pgdown with dividers: cursor traverses fewer non-divider lines than viewport height
+	// because divider rows consume visual space without being cursor-selectable
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model = result.(Model)
+	assert.Positive(t, model.nav.diffCursor, "cursor should have moved forward")
+
+	nonDividerCount := 0
+	for i := range model.nav.diffCursor {
+		if lines[i].ChangeType != git.ChangeDivider {
+			nonDividerCount++
+		}
+	}
+	assert.Less(t, nonDividerCount, pageHeight,
+		"non-divider positions traversed should be fewer than viewport height")
+}
+func TestModel_PgDownScrollsViewportByPage(t *testing.T) {
+	lines := make([]git.DiffLine, 200)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	assert.Equal(t, 0, model.layout.viewport.YOffset)
+
+	pageHeight := model.layout.viewport.Height
+	require.Positive(t, pageHeight)
+
+	// pgdown should scroll viewport by approximately a full page (not just 1 line)
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model = result.(Model)
+	assert.Equal(t, pageHeight, model.layout.viewport.YOffset,
+		"viewport should scroll to cursor position (full page), not just 1 line")
+
+	// second pgdown should scroll another full page
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model = result.(Model)
+	assert.Equal(t, 2*pageHeight, model.layout.viewport.YOffset,
+		"viewport should advance by another full page")
+}
+func TestModel_PgUpScrollsViewportByPage(t *testing.T) {
+	lines := make([]git.DiffLine, 200)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	pageHeight := model.layout.viewport.Height
+	require.Positive(t, pageHeight)
+
+	// move cursor to line 100
+	model.nav.diffCursor = 100
+	model.syncViewportToCursor()
+
+	// pgup should scroll viewport back by approximately a full page
+	prevOffset := model.layout.viewport.YOffset
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	model = result.(Model)
+
+	// viewport should scroll back significantly, not just 1 line
+	scrolled := prevOffset - model.layout.viewport.YOffset
+	assert.GreaterOrEqual(t, scrolled, pageHeight-1,
+		"viewport should scroll back by approximately a full page")
+}
+func TestModel_TreePgDownMovesCursorByPage(t *testing.T) {
+	files := make([]string, 50)
+	for i := range files {
+		files[i] = fmt.Sprintf("pkg/file%02d.go", i)
+	}
+	m := testModel(files, nil)
+	m.tree = testNewFileTree(files)
+	m.layout.focus = paneTree
+	m.layout.height = 20
+
+	// cursor starts on first file
+	assert.Equal(t, "pkg/file00.go", m.tree.SelectedFile())
+
+	pageSize := m.treePageSize()
+	require.Positive(t, pageSize)
+
+	// PgDown should advance cursor by page size files
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	model := result.(Model)
+	assert.Equal(t, fmt.Sprintf("pkg/file%02d.go", pageSize), model.tree.SelectedFile(),
+		"PgDown in tree should move cursor by page size")
+}
+func TestModel_TreePgUpMovesCursorByPage(t *testing.T) {
+	files := make([]string, 50)
+	for i := range files {
+		files[i] = fmt.Sprintf("pkg/file%02d.go", i)
+	}
+	m := testModel(files, nil)
+	m.tree = testNewFileTree(files)
+	m.layout.focus = paneTree
+	m.layout.height = 20
+
+	pageSize := m.treePageSize()
+	require.Positive(t, pageSize)
+
+	// move cursor to the last file, then back 10 - lands on file39
+	m.tree.Move(sidepane.MotionLast)
+	for range 10 {
+		m.tree.Move(sidepane.MotionUp)
+	}
+	assert.Equal(t, "pkg/file39.go", m.tree.SelectedFile())
+
+	// PgUp should move back by page size files
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	model := result.(Model)
+	expected := fmt.Sprintf("pkg/file%02d.go", 39-pageSize)
+	assert.Equal(t, expected, model.tree.SelectedFile(), "PgUp in tree should move cursor by page size")
+}
+func TestModel_TreeCtrlDMovesCursorByHalfPage(t *testing.T) {
+	files := make([]string, 50)
+	for i := range files {
+		files[i] = fmt.Sprintf("pkg/file%02d.go", i)
+	}
+	m := testModel(files, nil)
+	m.tree = testNewFileTree(files)
+	m.layout.focus = paneTree
+	m.layout.height = 20
+
+	assert.Equal(t, "pkg/file00.go", m.tree.SelectedFile())
+
+	pageSize := m.treePageSize()
+	require.Positive(t, pageSize)
+	halfPage := max(1, pageSize/2)
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	model := result.(Model)
+	assert.Equal(t, fmt.Sprintf("pkg/file%02d.go", halfPage), model.tree.SelectedFile(),
+		"ctrl+d in tree should move cursor by half page size")
+}
+func TestModel_TreeCtrlUMovesCursorByHalfPage(t *testing.T) {
+	files := make([]string, 50)
+	for i := range files {
+		files[i] = fmt.Sprintf("pkg/file%02d.go", i)
+	}
+	m := testModel(files, nil)
+	m.tree = testNewFileTree(files)
+	m.layout.focus = paneTree
+	m.layout.height = 20
+
+	pageSize := m.treePageSize()
+	require.Positive(t, pageSize)
+	halfPage := max(1, pageSize/2)
+
+	m.tree.Move(sidepane.MotionLast)
+	for range 10 {
+		m.tree.Move(sidepane.MotionUp)
+	}
+	assert.Equal(t, "pkg/file39.go", m.tree.SelectedFile())
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	model := result.(Model)
+	expected := fmt.Sprintf("pkg/file%02d.go", 39-halfPage)
+	assert.Equal(t, expected, model.tree.SelectedFile(), "ctrl+u in tree should move cursor by half page size")
+}
+func TestModel_TreeHomeEndMoveToBoundaries(t *testing.T) {
+	files := []string{"cmd/main.go", "internal/a.go", "internal/b.go", "internal/c.go", "pkg/util.go"}
+	m := testModel(files, nil)
+	m.tree = testNewFileTree(files)
+	m.layout.focus = paneTree
+
+	// move to middle
+	m.tree.Move(sidepane.MotionDown)
+	m.tree.Move(sidepane.MotionDown)
+	assert.NotEqual(t, "cmd/main.go", m.tree.SelectedFile())
+
+	// end should move to last file
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	model := result.(Model)
+	assert.Equal(t, "pkg/util.go", model.tree.SelectedFile(), "End in tree should move to last file")
+
+	// home should move to first file
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyHome})
+	model = result.(Model)
+	assert.Equal(t, "cmd/main.go", model.tree.SelectedFile(), "Home in tree should move to first file")
+}
+func TestModel_TreeScrollOffsetPersistsAcrossUpdates(t *testing.T) {
+	// many files so tree needs scrolling at the given height
+	files := make([]string, 30)
+	for i := range files {
+		files[i] = fmt.Sprintf("pkg/file%02d.go", i)
+	}
+	m := testModel(files, nil)
+	m.tree = testNewFileTree(files)
+	m.layout.focus = paneTree
+	m.layout.height = 10 // visible tree height = 10-3 = 7 rows
+
+	// scroll down past the visible window via repeated Update calls
+	var result tea.Model
+	for range 15 {
+		result, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		m = result.(Model)
+	}
+	// cursor should be well past the initial visible window
+	fileAfterDown := m.tree.SelectedFile()
+	assert.NotEqual(t, "pkg/file00.go", fileAfterDown, "cursor should have moved past first file")
+
+	// move up one step, the selected file should change by one
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	m = result.(Model)
+	assert.NotEqual(t, fileAfterDown, m.tree.SelectedFile(),
+		"selected file should change after moving up")
+	assert.NotEqual(t, "pkg/file00.go", m.tree.SelectedFile(),
+		"cursor should not jump back to first file after moving up within scrolled view")
+}
+func TestModel_FindHunks(t *testing.T) {
+	tests := []struct {
+		name   string
+		lines  []git.DiffLine
+		expect []int
+	}{
+		{name: "no lines", lines: nil, expect: nil},
+		{name: "all context", lines: []git.DiffLine{
+			{NewNum: 1, Content: "a", ChangeType: git.ChangeContext},
+			{NewNum: 2, Content: "b", ChangeType: git.ChangeContext},
+		}, expect: nil},
+		{name: "single chunk", lines: []git.DiffLine{
+			{NewNum: 1, Content: "a", ChangeType: git.ChangeContext},
+			{NewNum: 2, Content: "b", ChangeType: git.ChangeAdd},
+			{NewNum: 3, Content: "c", ChangeType: git.ChangeAdd},
+			{NewNum: 4, Content: "d", ChangeType: git.ChangeContext},
+		}, expect: []int{1}},
+		{name: "multiple chunks", lines: []git.DiffLine{
+			{NewNum: 1, Content: "a", ChangeType: git.ChangeContext},
+			{NewNum: 2, Content: "b", ChangeType: git.ChangeAdd},
+			{NewNum: 3, Content: "c", ChangeType: git.ChangeContext},
+			{OldNum: 4, Content: "d", ChangeType: git.ChangeRemove},
+			{OldNum: 5, Content: "e", ChangeType: git.ChangeRemove},
+			{NewNum: 4, Content: "f", ChangeType: git.ChangeContext},
+		}, expect: []int{1, 3}},
+		{name: "all changes", lines: []git.DiffLine{
+			{NewNum: 1, Content: "a", ChangeType: git.ChangeAdd},
+			{NewNum: 2, Content: "b", ChangeType: git.ChangeAdd},
+			{NewNum: 3, Content: "c", ChangeType: git.ChangeAdd},
+		}, expect: []int{0}},
+		{name: "mixed add and remove in one chunk", lines: []git.DiffLine{
+			{NewNum: 1, Content: "ctx", ChangeType: git.ChangeContext},
+			{OldNum: 2, Content: "old", ChangeType: git.ChangeRemove},
+			{NewNum: 2, Content: "new", ChangeType: git.ChangeAdd},
+			{NewNum: 3, Content: "ctx", ChangeType: git.ChangeContext},
+		}, expect: []int{1}},
+		{name: "chunks separated by divider", lines: []git.DiffLine{
+			{NewNum: 1, Content: "a", ChangeType: git.ChangeAdd},
+			{Content: "...", ChangeType: git.ChangeDivider},
+			{NewNum: 10, Content: "b", ChangeType: git.ChangeAdd},
+		}, expect: []int{0, 2}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := testModel(nil, nil)
+			m.file.lines = tc.lines
+			assert.Equal(t, tc.expect, m.findHunks())
+		})
+	}
+}
+func TestModel_CurrentHunk(t *testing.T) {
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "ctx", ChangeType: git.ChangeContext},  // 0
+		{NewNum: 2, Content: "add1", ChangeType: git.ChangeAdd},     // 1 - hunk 1 start
+		{NewNum: 3, Content: "add2", ChangeType: git.ChangeAdd},     // 2
+		{NewNum: 4, Content: "ctx2", ChangeType: git.ChangeContext}, // 3
+		{OldNum: 5, Content: "rem1", ChangeType: git.ChangeRemove},  // 4 - hunk 2 start
+		{NewNum: 5, Content: "ctx3", ChangeType: git.ChangeContext}, // 5
+		{NewNum: 6, Content: "add3", ChangeType: git.ChangeAdd},     // 6 - chunk 3 start
+	}
+
+	tests := []struct {
+		name      string
+		cursor    int
+		wantHunk  int
+		wantTotal int
+	}{
+		{name: "file annotation line", cursor: -1, wantHunk: 0, wantTotal: 3},
+		{name: "before first chunk", cursor: 0, wantHunk: 0, wantTotal: 3},
+		{name: "at first chunk start", cursor: 1, wantHunk: 1, wantTotal: 3},
+		{name: "inside first chunk", cursor: 2, wantHunk: 1, wantTotal: 3},
+		{name: "between chunks", cursor: 3, wantHunk: 0, wantTotal: 3},
+		{name: "at second chunk", cursor: 4, wantHunk: 2, wantTotal: 3},
+		{name: "between hunk 2 and 3", cursor: 5, wantHunk: 0, wantTotal: 3},
+		{name: "at third chunk", cursor: 6, wantHunk: 3, wantTotal: 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := testModel(nil, nil)
+			m.file.lines = lines
+			m.nav.diffCursor = tc.cursor
+			hunk, total := m.currentHunk()
+			assert.Equal(t, tc.wantHunk, hunk)
+			assert.Equal(t, tc.wantTotal, total)
+		})
+	}
+}
+func TestModel_CurrentHunkNoChanges(t *testing.T) {
+	m := testModel(nil, nil)
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, Content: "ctx", ChangeType: git.ChangeContext},
+	}
+	hunk, total := m.currentHunk()
+	assert.Equal(t, 0, hunk)
+	assert.Equal(t, 0, total)
+}
+
+func TestModel_NearestHunkIndex(t *testing.T) {
+	m := testModel([]string{"a.go"}, nil)
+	m.file.name = "a.go"
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, ChangeType: git.ChangeContext}, // 0
+		{NewNum: 2, ChangeType: git.ChangeAdd},     // 1 hunk 0 start
+		{NewNum: 3, ChangeType: git.ChangeContext}, // 2
+		{NewNum: 4, ChangeType: git.ChangeContext}, // 3
+		{NewNum: 5, ChangeType: git.ChangeAdd},     // 4 hunk 1 start
+		{NewNum: 6, ChangeType: git.ChangeContext}, // 5
+	}
+	tests := []struct {
+		name string
+		idx  int
+		want int
+	}{
+		{"before first hunk", 0, 0},
+		{"on first hunk", 1, 0},
+		{"between hunks", 3, 0},
+		{"on second hunk", 4, 1},
+		{"after second hunk", 5, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, m.nearestHunkIndex(tt.idx))
+		})
+	}
+
+	t.Run("no hunks returns -1", func(t *testing.T) {
+		m := testModel([]string{"a.go"}, nil)
+		m.file.name = "a.go"
+		m.file.lines = []git.DiffLine{
+			{NewNum: 1, ChangeType: git.ChangeContext},
+			{NewNum: 2, ChangeType: git.ChangeContext},
+		}
+		assert.Equal(t, -1, m.nearestHunkIndex(0))
+	})
+}
+
+func TestModel_MoveToNextHunk(t *testing.T) {
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "ctx", ChangeType: git.ChangeContext},  // 0
+		{NewNum: 2, Content: "add", ChangeType: git.ChangeAdd},      // 1 - hunk 1
+		{NewNum: 3, Content: "ctx2", ChangeType: git.ChangeContext}, // 2
+		{NewNum: 4, Content: "add2", ChangeType: git.ChangeAdd},     // 3 - hunk 2
+		{NewNum: 5, Content: "ctx3", ChangeType: git.ChangeContext}, // 4
+	}
+
+	m := testModel(nil, nil)
+	m.file.lines = lines
+	m.nav.diffCursor = 0
+	m.file.name = "a.go"
+	m.layout.viewport.Height = 20
+
+	m.moveToNextHunk()
+	assert.Equal(t, 1, m.nav.diffCursor, "should jump to hunk 1")
+
+	m.moveToNextHunk()
+	assert.Equal(t, 3, m.nav.diffCursor, "should jump to hunk 2")
+
+	// at last chunk, should not move
+	m.moveToNextHunk()
+	assert.Equal(t, 3, m.nav.diffCursor, "should stay at last chunk")
+}
+func TestModel_MoveToPrevHunk(t *testing.T) {
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "ctx", ChangeType: git.ChangeContext},  // 0
+		{NewNum: 2, Content: "add", ChangeType: git.ChangeAdd},      // 1 - hunk 1
+		{NewNum: 3, Content: "ctx2", ChangeType: git.ChangeContext}, // 2
+		{NewNum: 4, Content: "add2", ChangeType: git.ChangeAdd},     // 3 - hunk 2
+		{NewNum: 5, Content: "ctx3", ChangeType: git.ChangeContext}, // 4
+	}
+
+	m := testModel(nil, nil)
+	m.file.lines = lines
+	m.nav.diffCursor = 4
+	m.file.name = "a.go"
+	m.layout.viewport.Height = 20
+
+	m.moveToPrevHunk()
+	assert.Equal(t, 3, m.nav.diffCursor, "should jump to hunk 2")
+
+	m.moveToPrevHunk()
+	assert.Equal(t, 1, m.nav.diffCursor, "should jump to hunk 1")
+
+	// at first chunk, should not move
+	m.moveToPrevHunk()
+	assert.Equal(t, 1, m.nav.diffCursor, "should stay at first chunk")
+}
+func TestModel_CenterHunkInViewport_SmallHunk(t *testing.T) {
+	// build a file with context, a small 3-line hunk, and more context
+	// total: 50 lines, hunk at indices 20-22
+	var lines []git.DiffLine
+	for i := 1; i <= 20; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+	lines = append(lines,
+		git.DiffLine{NewNum: 21, Content: "add1", ChangeType: git.ChangeAdd}, // idx 20
+		git.DiffLine{NewNum: 22, Content: "add2", ChangeType: git.ChangeAdd}, // idx 21
+		git.DiffLine{NewNum: 23, Content: "add3", ChangeType: git.ChangeAdd}, // idx 22
+	)
+	for i := 24; i <= 50; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = result.(Model)
+	result, _ = m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.layout.focus = paneDiff
+	vpHeight := m.layout.viewport.Height
+	require.Positive(t, vpHeight)
+
+	m.nav.diffCursor = 0
+	m.moveToNextHunk()
+	assert.Equal(t, 20, m.nav.diffCursor, "cursor should land on first line of hunk")
+
+	// hunk midpoint: cursorY + hunkHeight/2 = 20 + 1 = 21
+	// offset: midY - vpHeight/2
+	expectedOffset := 21 - vpHeight/2
+	assert.Equal(t, expectedOffset, m.layout.viewport.YOffset, "small hunk should be centered by its midpoint")
+}
+
+func TestModel_CenterHunkInViewport_LargeHunk(t *testing.T) {
+	// hunk larger than viewport
+	var lines []git.DiffLine
+	for i := 1; i <= 10; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+	for i := 11; i <= 110; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "add", ChangeType: git.ChangeAdd})
+	}
+	lines = append(lines, git.DiffLine{NewNum: 111, Content: "ctx", ChangeType: git.ChangeContext})
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = result.(Model)
+	result, _ = m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.layout.focus = paneDiff
+
+	m.nav.diffCursor = 0
+	m.moveToNextHunk()
+	assert.Equal(t, 10, m.nav.diffCursor, "cursor should land on first line of hunk")
+
+	// hunk is 100 lines >> viewport, so offset = cursorY - 2 = 10 - 2 = 8
+	assert.Equal(t, 8, m.layout.viewport.YOffset, "large hunk should place first line near top with context margin")
+}
+
+func TestModel_CenterHunkInViewport_HunkAtStart(t *testing.T) {
+	// hunk starts at line 0 - offset should be clamped to 0
+	var lines []git.DiffLine
+	lines = append(lines,
+		git.DiffLine{NewNum: 1, Content: "add1", ChangeType: git.ChangeAdd},
+		git.DiffLine{NewNum: 2, Content: "add2", ChangeType: git.ChangeAdd},
+	)
+	for i := 3; i <= 50; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = result.(Model)
+	result, _ = m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.layout.focus = paneDiff
+
+	m.nav.diffCursor = 10
+	m.moveToPrevHunk()
+	assert.Equal(t, 0, m.nav.diffCursor, "cursor should land on first line")
+	assert.Equal(t, 0, m.layout.viewport.YOffset, "offset should be clamped to 0 when hunk is near top")
+}
+
+func TestModel_CenterHunkInViewport_PrevHunkCenters(t *testing.T) {
+	// verify moveToPrevHunk also centers the hunk
+	var lines []git.DiffLine
+	for i := 1; i <= 25; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+	lines = append(lines,
+		git.DiffLine{NewNum: 26, Content: "add1", ChangeType: git.ChangeAdd}, // idx 25
+		git.DiffLine{NewNum: 27, Content: "add2", ChangeType: git.ChangeAdd}, // idx 26
+	)
+	for i := 28; i <= 60; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = result.(Model)
+	result, _ = m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.layout.focus = paneDiff
+	vpHeight := m.layout.viewport.Height
+
+	m.nav.diffCursor = 40
+	m.syncViewportToCursor()
+	m.moveToPrevHunk()
+	assert.Equal(t, 25, m.nav.diffCursor, "cursor should land on first line of hunk")
+
+	// hunk midpoint: 25 + 2/2 = 26, offset: 26 - vpHeight/2
+	expectedOffset := 26 - vpHeight/2
+	assert.Equal(t, expectedOffset, m.layout.viewport.YOffset, "prevHunk should center the hunk by its midpoint")
+}
+
+func TestModel_CenterHunkInViewport_SingleLineHunk(t *testing.T) {
+	// single-line hunk should still be centered
+	var lines []git.DiffLine
+	for i := 1; i <= 25; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+	lines = append(lines, git.DiffLine{NewNum: 26, Content: "add", ChangeType: git.ChangeAdd}) // idx 25
+	for i := 27; i <= 60; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = result.(Model)
+	result, _ = m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.layout.focus = paneDiff
+	vpHeight := m.layout.viewport.Height
+
+	m.nav.diffCursor = 0
+	m.moveToNextHunk()
+	assert.Equal(t, 25, m.nav.diffCursor)
+
+	// single-line hunk: midY = 25 + 0 = 25, offset = 25 - vpHeight/2
+	expectedOffset := 25 - vpHeight/2
+	assert.Equal(t, expectedOffset, m.layout.viewport.YOffset, "single-line hunk midpoint centered in viewport")
+}
+
+func TestModel_CenterHunkInViewport_WrapMode(t *testing.T) {
+	// when wrap mode is on, long changed lines occupy multiple visual rows.
+	// the hunk visual height (and thus the centering offset) must account for them
+	var lines []git.DiffLine
+	for i := 1; i <= 20; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+	// two changed lines: one short, one long enough to wrap
+	lines = append(lines,
+		git.DiffLine{NewNum: 21, Content: "short add", ChangeType: git.ChangeAdd},              // idx 20
+		git.DiffLine{NewNum: 22, Content: strings.Repeat("a", 200), ChangeType: git.ChangeAdd}, // idx 21, wraps
+	)
+	for i := 23; i <= 60; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+	m = result.(Model)
+	result, _ = m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.layout.focus = paneDiff
+	m.modes.wrap = true
+	// force single-file mode so tree pane is hidden and wrap width is deterministic:
+	// diffContentWidth = 80 - 4 = 76, wrapWidth = 76 - 3 (wrap gutter) = 73
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	vpHeight := m.layout.viewport.Height
+	require.Positive(t, vpHeight)
+
+	m.nav.diffCursor = 0
+	m.moveToNextHunk()
+	assert.Equal(t, 20, m.nav.diffCursor, "cursor should land on first line of hunk")
+
+	// pinned literals independent of production helpers:
+	// - 20 context lines above hunk, each 1 visual row -> cursorY = 20
+	// - first add line "short add" -> 1 row
+	// - second add line is 200 'a' chars at wrap width 73 -> 3 rows
+	// - total hunk visual height = 1 + 3 = 4
+	const cursorY = 20
+	const hunkVisualHeight = 4
+	expectedOffset := max(0, cursorY+hunkVisualHeight/2-vpHeight/2)
+	assert.Equal(t, expectedOffset, m.layout.viewport.YOffset, "wrap mode: offset should account for wrapped line height")
+}
+
+func TestModel_CenterHunkInViewport_WithAnnotation(t *testing.T) {
+	// an inline annotation on a hunk line adds visual rows that must be
+	// included when computing the hunk midpoint for centering
+	var lines []git.DiffLine
+	for i := 1; i <= 25; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+	lines = append(lines,
+		git.DiffLine{NewNum: 26, Content: "add1", ChangeType: git.ChangeAdd}, // idx 25
+		git.DiffLine{NewNum: 27, Content: "add2", ChangeType: git.ChangeAdd}, // idx 26
+	)
+	for i := 28; i <= 60; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = result.(Model)
+	result, _ = m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.layout.focus = paneDiff
+	vpHeight := m.layout.viewport.Height
+
+	// add an annotation on the first changed line
+	m.store.Add(annot.Annotation{File: "a.go", Line: 26, Type: "+", Comment: "review note"})
+	defer m.store.Delete("a.go", 26, "+")
+
+	m.nav.diffCursor = 0
+	m.moveToNextHunk()
+	assert.Equal(t, 25, m.nav.diffCursor, "cursor should land on first line of hunk")
+
+	// pinned literals independent of production helpers:
+	// - 25 context lines above hunk, each 1 visual row -> cursorY = 25
+	// - 2 short add lines, each 1 row
+	// - "review note" annotation (short, no wrap) -> 1 row
+	// - total hunk visual height = 2 + 1 = 3
+	const cursorY = 25
+	const hunkVisualHeight = 3
+	expectedOffset := max(0, cursorY+hunkVisualHeight/2-vpHeight/2)
+	assert.Equal(t, expectedOffset, m.layout.viewport.YOffset, "annotation: offset should include annotation visual rows")
+}
+
+func TestModel_CenterHunkInViewport_NoOpOnContextLine(t *testing.T) {
+	// calling centerHunkInViewport when the cursor is on a context line
+	// should be a no-op - viewport offset must not change
+	var lines []git.DiffLine
+	for i := 1; i <= 30; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+	lines = append(lines, git.DiffLine{NewNum: 31, Content: "add", ChangeType: git.ChangeAdd})
+	for i := 32; i <= 60; i++ {
+		lines = append(lines, git.DiffLine{NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = result.(Model)
+	result, _ = m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.layout.focus = paneDiff
+
+	// position cursor on a context line and set a known viewport offset
+	m.nav.diffCursor = 10
+	m.layout.viewport.SetYOffset(5)
+	m.layout.viewport.SetContent(m.renderDiff())
+	beforeOffset := m.layout.viewport.YOffset
+
+	m.centerHunkInViewport()
+	assert.Equal(t, beforeOffset, m.layout.viewport.YOffset, "should be no-op when cursor is on context line")
+}
+
+func TestModel_CenterHunkInViewport_CollapsedMode(t *testing.T) {
+	// in collapsed mode, removed lines in a mixed add/remove hunk are hidden.
+	// the visual height should only count visible (add) lines
+	var lines []git.DiffLine
+	for i := 1; i <= 20; i++ {
+		lines = append(lines, git.DiffLine{OldNum: i, NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+	// mixed hunk: 3 removes then 3 adds (indices 20-25)
+	lines = append(lines,
+		git.DiffLine{OldNum: 21, Content: "old1", ChangeType: git.ChangeRemove}, // idx 20, hidden in collapsed
+		git.DiffLine{OldNum: 22, Content: "old2", ChangeType: git.ChangeRemove}, // idx 21, hidden
+		git.DiffLine{OldNum: 23, Content: "old3", ChangeType: git.ChangeRemove}, // idx 22, hidden
+		git.DiffLine{NewNum: 21, Content: "new1", ChangeType: git.ChangeAdd},    // idx 23, visible
+		git.DiffLine{NewNum: 22, Content: "new2", ChangeType: git.ChangeAdd},    // idx 24, visible
+		git.DiffLine{NewNum: 23, Content: "new3", ChangeType: git.ChangeAdd},    // idx 25, visible
+	)
+	for i := 24; i <= 60; i++ {
+		lines = append(lines, git.DiffLine{OldNum: i, NewNum: i, Content: "ctx", ChangeType: git.ChangeContext})
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = result.(Model)
+	result, _ = m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.layout.focus = paneDiff
+	m.modes.collapsed.enabled = true
+	m.modes.collapsed.expandedHunks = make(map[int]bool)
+	vpHeight := m.layout.viewport.Height
+
+	m.nav.diffCursor = 0
+	m.moveToNextHunk()
+	// in collapsed mode, cursor lands on first visible line (first add, idx 23)
+	assert.Equal(t, 23, m.nav.diffCursor, "cursor should skip hidden removes and land on first add")
+
+	// pinned literals independent of production helpers:
+	// - 20 context lines above hunk, each 1 visual row
+	// - in collapsed mode, 3 hidden removes contribute 0 rows each -> cursorY = 20
+	// - hunk visual height = 3 visible add lines (removes contribute 0)
+	const cursorY = 20
+	const hunkVisualHeight = 3
+	expectedOffset := max(0, cursorY+hunkVisualHeight/2-vpHeight/2)
+	assert.Equal(t, expectedOffset, m.layout.viewport.YOffset, "collapsed mode: offset should only count visible lines")
+}
+
+func TestModel_HunkNavigationViaKeys(t *testing.T) {
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "ctx", ChangeType: git.ChangeContext},  // 0
+		{NewNum: 2, Content: "add", ChangeType: git.ChangeAdd},      // 1 - hunk 1
+		{NewNum: 3, Content: "ctx2", ChangeType: git.ChangeContext}, // 2
+		{NewNum: 4, Content: "add2", ChangeType: git.ChangeAdd},     // 3 - hunk 2
+	}
+
+	m := testModel(nil, nil)
+	m.file.lines = lines
+	m.nav.diffCursor = 0
+	m.file.name = "a.go"
+	m.layout.focus = paneDiff
+	m.layout.viewport.Height = 20
+
+	// press ] to go to next chunk
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	model := result.(Model)
+	assert.Equal(t, 1, model.nav.diffCursor, "] should jump to first chunk")
+
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	model = result.(Model)
+	assert.Equal(t, 3, model.nav.diffCursor, "] should jump to second chunk")
+
+	// press [ to go to previous chunk
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'['}})
+	model = result.(Model)
+	assert.Equal(t, 1, model.nav.diffCursor, "[ should jump back to first chunk")
+}
+func TestModel_HorizontalScroll(t *testing.T) {
+	longLine := "package " + strings.Repeat("x", 200)
+	lines := []git.DiffLine{{OldNum: 1, NewNum: 1, Content: longLine, ChangeType: git.ChangeContext}}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.layout.focus = paneDiff
+
+	assert.Equal(t, 0, m.layout.scrollX)
+
+	// scroll right
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m = result.(Model)
+	assert.Equal(t, scrollStep, m.layout.scrollX)
+
+	// scroll left back to 0
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m = result.(Model)
+	assert.Equal(t, 0, m.layout.scrollX)
+
+	// scroll left at 0 stays at 0
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m = result.(Model)
+	assert.Equal(t, 0, m.layout.scrollX)
+}
+func TestModel_HorizontalScrollResetsOnFileLoad(t *testing.T) {
+	lines := []git.DiffLine{{OldNum: 1, NewNum: 1, Content: "line1", ChangeType: git.ChangeContext}}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.layout.scrollX = 20
+
+	// loading new file should reset scrollX
+	result, _ = m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	assert.Equal(t, 0, m.layout.scrollX)
+}
+func TestModel_PaneHeight(t *testing.T) {
+	tests := []struct {
+		name         string
+		noStatusBar  bool
+		height, want int
+	}{
+		{name: "with status bar", noStatusBar: false, height: 40, want: 37},
+		{name: "without status bar", noStatusBar: true, height: 40, want: 38},
+		{name: "min clamp with status", noStatusBar: false, height: 3, want: 1},
+		{name: "min clamp without status", noStatusBar: true, height: 2, want: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := testModel(nil, nil)
+			m.layout.height = tc.height
+			m.cfg.noStatusBar = tc.noStatusBar
+			assert.Equal(t, tc.want, m.paneHeight())
+		})
+	}
+}
+func TestModel_WrapContent(t *testing.T) {
+	m := testModel(nil, nil)
+
+	t.Run("short line unchanged", func(t *testing.T) {
+		lines := m.wrapContent("hello world", 40)
+		assert.Equal(t, []string{"hello world"}, lines)
+	})
+
+	t.Run("long line wraps at word boundary", func(t *testing.T) {
+		lines := m.wrapContent("the quick brown fox jumps over the lazy dog", 20)
+		assert.Greater(t, len(lines), 1, "should produce multiple lines")
+		for _, line := range lines {
+			assert.LessOrEqual(t, len(line), 20, "each line should fit within width")
+		}
+	})
+
+	t.Run("empty content", func(t *testing.T) {
+		lines := m.wrapContent("", 40)
+		assert.Equal(t, []string{""}, lines)
+	})
+
+	t.Run("zero width returns content as-is", func(t *testing.T) {
+		lines := m.wrapContent("hello", 0)
+		assert.Equal(t, []string{"hello"}, lines)
+	})
+
+	t.Run("negative width returns content as-is", func(t *testing.T) {
+		lines := m.wrapContent("hello", -5)
+		assert.Equal(t, []string{"hello"}, lines)
+	})
+
+	t.Run("single long word", func(t *testing.T) {
+		lines := m.wrapContent("abcdefghijklmnopqrstuvwxyz", 10)
+		require.NotEmpty(t, lines)
+		// ansi.Wrap hard-wraps words that exceed the limit
+		for _, line := range lines {
+			assert.LessOrEqual(t, len(line), 10+1, "long words should be hard-wrapped") // +1 for potential breakpoint
+		}
+	})
+
+	t.Run("content with ANSI codes", func(t *testing.T) {
+		ansiContent := "\033[32mgreen text\033[0m and normal"
+		lines := m.wrapContent(ansiContent, 15)
+		require.NotEmpty(t, lines)
+		// the wrapped output should still contain ANSI codes
+		joined := strings.Join(lines, "")
+		assert.Contains(t, joined, "\033[32m", "ANSI codes should be preserved")
+	})
+
+	t.Run("multi-byte characters", func(t *testing.T) {
+		lines := m.wrapContent("日本語テスト hello world", 10)
+		require.NotEmpty(t, lines)
+		assert.Greater(t, len(lines), 1, "CJK text should wrap")
+	})
+}
+func TestModel_RenderDiffLineWithWrap(t *testing.T) {
+	m := testModel(nil, nil)
+	m.modes.wrap = true
+	m.layout.width = 60
+	m.layout.treeWidth = 12
+
+	t.Run("short line no continuation", func(t *testing.T) {
+		var b strings.Builder
+		dl := git.DiffLine{Content: "short", ChangeType: git.ChangeAdd, NewNum: 1}
+		m.renderDiffLine(&b, 0, dl, m.decorations())
+		output := b.String()
+		assert.Contains(t, output, " + short")
+		assert.NotContains(t, output, "↪", "short line should not have continuation")
+		assert.Equal(t, 1, strings.Count(output, "\n"), "should produce exactly one line")
+	})
+
+	t.Run("long add line wraps with continuation markers", func(t *testing.T) {
+		var b strings.Builder
+		longContent := "this is a very long line that should definitely be wrapped at word boundaries to fit the viewport"
+		dl := git.DiffLine{Content: longContent, ChangeType: git.ChangeAdd, NewNum: 1}
+		m.renderDiffLine(&b, 0, dl, m.decorations())
+		output := b.String()
+
+		lines := strings.Split(strings.TrimSuffix(output, "\n"), "\n")
+		require.Greater(t, len(lines), 1, "long line should wrap into multiple lines")
+
+		// first line should have " + " prefix
+		assert.Contains(t, lines[0], " + ", "first line should have add prefix")
+
+		// continuation lines should have the wrap-marker prefix
+		for _, line := range lines[1:] {
+			assert.Contains(t, line, " ↪ ", "continuation lines should have ↪ marker")
+		}
+	})
+
+	t.Run("long remove line wraps with continuation markers", func(t *testing.T) {
+		var b strings.Builder
+		longContent := "this is a removed line that is very long and should be wrapped at word boundaries to fit the viewport width"
+		dl := git.DiffLine{Content: longContent, ChangeType: git.ChangeRemove, OldNum: 5}
+		m.renderDiffLine(&b, 0, dl, m.decorations())
+		output := b.String()
+
+		lines := strings.Split(strings.TrimSuffix(output, "\n"), "\n")
+		require.Greater(t, len(lines), 1, "long line should wrap")
+		assert.Contains(t, lines[0], " - ", "first line should have remove prefix")
+		for _, line := range lines[1:] {
+			assert.Contains(t, line, " ↪ ", "continuation lines should have ↪ marker")
+		}
+	})
+
+	t.Run("long context line wraps with continuation markers", func(t *testing.T) {
+		var b strings.Builder
+		longContent := "this is a context line that is very long and should be wrapped at word boundaries for readability"
+		dl := git.DiffLine{Content: longContent, ChangeType: git.ChangeContext, NewNum: 10}
+		m.renderDiffLine(&b, 0, dl, m.decorations())
+		output := b.String()
+
+		lines := strings.Split(strings.TrimSuffix(output, "\n"), "\n")
+		require.Greater(t, len(lines), 1, "long context line should wrap")
+		for _, line := range lines[1:] {
+			assert.Contains(t, line, " ↪ ", "continuation lines should have ↪ marker")
+		}
+	})
+
+	t.Run("divider lines are not wrapped", func(t *testing.T) {
+		var b strings.Builder
+		dl := git.DiffLine{Content: "@@ -1,5 +1,7 @@", ChangeType: git.ChangeDivider}
+		m.renderDiffLine(&b, 0, dl, m.decorations())
+		output := b.String()
+		assert.NotContains(t, output, "↪", "dividers should not be wrapped")
+		assert.Equal(t, 1, strings.Count(output, "\n"), "divider should be a single line")
+	})
+
+	t.Run("cursor only on first visual line", func(t *testing.T) {
+		m.nav.diffCursor = 0
+		m.layout.focus = paneDiff
+		m.nav.onAnnotationRow = false
+
+		var b strings.Builder
+		longContent := "this is a very long line that should definitely be wrapped at word boundaries to test cursor placement"
+		dl := git.DiffLine{Content: longContent, ChangeType: git.ChangeAdd, NewNum: 1}
+		m.renderDiffLine(&b, 0, dl, m.decorations())
+		output := b.String()
+
+		lines := strings.Split(strings.TrimSuffix(output, "\n"), "\n")
+		require.Greater(t, len(lines), 1, "should have continuation lines")
+		assert.Contains(t, lines[0], "▶", "first line should have cursor")
+		for _, line := range lines[1:] {
+			assert.NotContains(t, line, "▶", "continuation lines should not have cursor")
+		}
+	})
+
+	t.Run("no horizontal scroll in wrap mode", func(t *testing.T) {
+		m.layout.scrollX = 10
+		m.modes.wrap = true
+
+		var b strings.Builder
+		dl := git.DiffLine{Content: "@@ -1,3 +1,3 @@", ChangeType: git.ChangeDivider}
+		m.renderDiffLine(&b, 0, dl, m.decorations())
+
+		// divider falls through to non-wrap path but ansi.Cut should be skipped
+		output := b.String()
+		assert.Contains(t, output, "@@", "divider content should not be scrolled in wrap mode")
+
+		m.layout.scrollX = 0 // reset
+	})
+}
+func TestModel_WrappedLineCount(t *testing.T) {
+	m := testModel(nil, nil)
+	m.file.name = "a.go"
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, Content: "short", ChangeType: git.ChangeContext},
+		{NewNum: 2, Content: strings.Repeat("x", 200), ChangeType: git.ChangeAdd},
+		{Content: "@@ -1,3 +1,3 @@", ChangeType: git.ChangeDivider},
+		{OldNum: 3, Content: strings.Repeat("y", 200), ChangeType: git.ChangeRemove},
+	}
+
+	t.Run("wrap off returns 1 for all lines", func(t *testing.T) {
+		m.modes.wrap = false
+		assert.Equal(t, 1, m.wrappedLineCount(0))
+		assert.Equal(t, 1, m.wrappedLineCount(1))
+		assert.Equal(t, 1, m.wrappedLineCount(2))
+		assert.Equal(t, 1, m.wrappedLineCount(3))
+	})
+
+	t.Run("wrap on, short line returns 1", func(t *testing.T) {
+		m.modes.wrap = true
+		assert.Equal(t, 1, m.wrappedLineCount(0))
+	})
+
+	t.Run("wrap on, long line returns more than 1", func(t *testing.T) {
+		m.modes.wrap = true
+		count := m.wrappedLineCount(1)
+		assert.Greater(t, count, 1, "long add line should wrap to multiple visual rows")
+	})
+
+	t.Run("wrap on, divider always returns 1", func(t *testing.T) {
+		m.modes.wrap = true
+		assert.Equal(t, 1, m.wrappedLineCount(2))
+	})
+
+	t.Run("wrap on, long remove line wraps", func(t *testing.T) {
+		m.modes.wrap = true
+		count := m.wrappedLineCount(3)
+		assert.Greater(t, count, 1, "long remove line should wrap to multiple visual rows")
+	})
+
+	t.Run("out of bounds returns 1", func(t *testing.T) {
+		m.modes.wrap = true
+		assert.Equal(t, 1, m.wrappedLineCount(-1))
+		assert.Equal(t, 1, m.wrappedLineCount(100))
+	})
+}
+func TestModel_CursorViewportYWithWrap(t *testing.T) {
+	m := testModel(nil, nil)
+	m.file.name = "a.go"
+	m.modes.wrap = true
+	// use a narrow width so wrapping is predictable
+	m.layout.width = 60
+	m.layout.treeWidth = 20
+
+	// diffContentWidth = 60 - 20 - 4 - 1 = 35
+	// wrapWidth = 35 - 3 (gutter) = 32
+
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, Content: "short line", ChangeType: git.ChangeContext},                                             // idx 0, fits in 1 row
+		{NewNum: 2, Content: strings.Repeat("a", 60), ChangeType: git.ChangeAdd},                                      // idx 1, wraps to ~2 rows
+		{NewNum: 3, Content: "another short line", ChangeType: git.ChangeContext},                                     // idx 2, fits in 1 row
+		{NewNum: 4, Content: "this is a really long line that " + strings.Repeat("z", 60), ChangeType: git.ChangeAdd}, // idx 3, wraps to ~3 rows
+	}
+
+	// verify wrapping counts are consistent
+	count0 := m.wrappedLineCount(0)
+	count1 := m.wrappedLineCount(1)
+	count2 := m.wrappedLineCount(2)
+	assert.Equal(t, 1, count0, "short context line should be 1 row")
+	assert.Greater(t, count1, 1, "long add line should wrap")
+	assert.Equal(t, 1, count2, "short context line should be 1 row")
+
+	t.Run("cursor at 0, no wrapping before it", func(t *testing.T) {
+		m.nav.diffCursor = 0
+		m.nav.onAnnotationRow = false
+		assert.Equal(t, 0, m.cursorViewportY())
+	})
+
+	t.Run("cursor at 1, after short line 0", func(t *testing.T) {
+		m.nav.diffCursor = 1
+		m.nav.onAnnotationRow = false
+		assert.Equal(t, count0, m.cursorViewportY())
+	})
+
+	t.Run("cursor at 2, after wrapped line 1", func(t *testing.T) {
+		m.nav.diffCursor = 2
+		m.nav.onAnnotationRow = false
+		assert.Equal(t, count0+count1, m.cursorViewportY())
+	})
+
+	t.Run("cursor at 3, after lines 0+1+2", func(t *testing.T) {
+		m.nav.diffCursor = 3
+		m.nav.onAnnotationRow = false
+		assert.Equal(t, count0+count1+count2, m.cursorViewportY())
+	})
+
+	t.Run("cursor on annotation after wrapped line", func(t *testing.T) {
+		// add annotation on line 2 (idx 1, the long wrapped add line)
+		m.store.Add(annot.Annotation{File: "a.go", Line: 2, Type: "+", Comment: "note"})
+		defer func() { m.store.Delete("a.go", 2, "+") }()
+
+		m.nav.diffCursor = 2
+		m.nav.onAnnotationRow = false
+		// cursor at line 2: count0 + count1 + 1 (annotation row after line 1)
+		assert.Equal(t, count0+count1+1, m.cursorViewportY())
+	})
+
+	t.Run("cursor on annotation sub-line of wrapped line", func(t *testing.T) {
+		m.store.Add(annot.Annotation{File: "a.go", Line: 3, Type: " ", Comment: "note on ctx"})
+		defer func() { m.store.Delete("a.go", 3, " ") }()
+
+		m.nav.diffCursor = 2
+		m.nav.onAnnotationRow = true
+		// on annotation sub-line of line 2: offset is line0 + line1 rows + wrappedLineCount(2)
+		assert.Equal(t, count0+count1+count2, m.cursorViewportY())
+	})
+}
+
+func TestModel_SyncViewportToCursor_WrappedLineBottomVisible(t *testing.T) {
+	// cursor sitting on a wrapped line at the bottom of the viewport:
+	// scroll must shift by the extra wrap rows so the line's visual bottom,
+	// not just its first row, stays within the viewport.
+	m := testModel(nil, nil)
+	m.file.name = "a.go"
+	m.modes.wrap = true
+	m.layout.width = 60
+	m.layout.treeWidth = 20
+	m.layout.viewport.Width = 40
+	m.layout.viewport.Height = 4
+
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, Content: "short1", ChangeType: git.ChangeContext},
+		{NewNum: 2, Content: "short2", ChangeType: git.ChangeContext},
+		{NewNum: 3, Content: "short3", ChangeType: git.ChangeContext},
+		{NewNum: 4, Content: strings.Repeat("a", 120), ChangeType: git.ChangeAdd}, // wraps to 3+ rows
+	}
+
+	wrapRows := m.wrappedLineCount(3)
+	require.GreaterOrEqual(t, wrapRows, 3, "long line should wrap to at least 3 rows")
+
+	m.nav.diffCursor = 3
+	m.layout.viewport.SetContent(m.renderDiff())
+	m.layout.viewport.SetYOffset(0)
+
+	m.syncViewportToCursor()
+
+	cursorTop := m.cursorViewportY()
+	cursorBottom := cursorTop + wrapRows - 1
+	expectedOffset := cursorBottom - m.layout.viewport.Height + 1
+	assert.Equal(t, expectedOffset, m.layout.viewport.YOffset,
+		"YOffset should pin the wrapped line's visual bottom to the viewport bottom")
+	assert.GreaterOrEqual(t, cursorTop, m.layout.viewport.YOffset, "cursor top must be visible")
+	assert.Less(t, cursorBottom, m.layout.viewport.YOffset+m.layout.viewport.Height,
+		"last wrap row must be visible (was clipped below viewport before fix)")
+}
+
+func TestModel_SyncViewportToCursor_AnnotationRowsVisible(t *testing.T) {
+	// multi-row annotation injected below a diff line at the bottom
+	// of the viewport: the down-scroll branch must compare the annotation's
+	// last row, not the cursor's top row, or the rows render past the edge.
+	m := testModel(nil, nil)
+	m.file.name = "a.go"
+	m.layout.width = 80
+	m.layout.treeWidth = 20
+
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, Content: "line1", ChangeType: git.ChangeContext},
+		{NewNum: 2, Content: "line2", ChangeType: git.ChangeContext},
+		{NewNum: 3, Content: "line3", ChangeType: git.ChangeContext},
+		{NewNum: 4, Content: "line4", ChangeType: git.ChangeContext},
+	}
+	m.store.Add(annot.Annotation{File: "a.go", Line: 4, Type: " ",
+		Comment: "line-a\nline-b\nline-c"})
+
+	annotRows := m.wrappedAnnotationLineCount(m.annotationKey(4, " "))
+	require.Equal(t, 3, annotRows, "multi-line annotation should occupy 3 rows")
+
+	// viewport height of 4 comfortably fits the 1-row diff line + 3 annotation rows
+	m.layout.viewport.Width = 50
+	m.layout.viewport.Height = 4
+	m.nav.diffCursor = 3
+	m.layout.viewport.SetContent(m.renderDiff())
+	m.layout.viewport.SetYOffset(0)
+
+	m.syncViewportToCursor()
+
+	cursorTop := m.cursorViewportY()
+	cursorBottom := cursorTop + 1 + annotRows - 1 // 1 diff row + annotation rows
+	expectedOffset := cursorBottom - m.layout.viewport.Height + 1
+	assert.Equal(t, expectedOffset, m.layout.viewport.YOffset,
+		"YOffset should pin the annotation's visual bottom to the viewport bottom")
+	assert.GreaterOrEqual(t, cursorTop, m.layout.viewport.YOffset, "cursor top must be visible")
+	assert.Less(t, cursorBottom, m.layout.viewport.YOffset+m.layout.viewport.Height,
+		"last annotation row must be visible (was clipped below viewport before fix)")
+}
+
+func TestModel_SyncViewportToCursor_LineTallerThanViewport(t *testing.T) {
+	// when the cursor's logical line is taller than the viewport, the floor
+	// min(cursorBottom-Height+1, cursorTop) anchors scroll at cursorTop so the
+	// cursor itself stays visible. trailing rows overflow by necessity.
+	m := testModel(nil, nil)
+	m.file.name = "a.go"
+	m.modes.wrap = true
+	m.layout.width = 60
+	m.layout.treeWidth = 20
+	m.layout.viewport.Width = 40
+	m.layout.viewport.Height = 2
+
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, Content: "short1", ChangeType: git.ChangeContext},
+		{NewNum: 2, Content: strings.Repeat("b", 200), ChangeType: git.ChangeAdd}, // wraps to 5+ rows
+	}
+
+	wrapRows := m.wrappedLineCount(1)
+	require.Greater(t, wrapRows, m.layout.viewport.Height, "wrapped line must exceed viewport height")
+
+	m.nav.diffCursor = 1
+	m.layout.viewport.SetContent(m.renderDiff())
+	m.layout.viewport.SetYOffset(0)
+
+	m.syncViewportToCursor()
+
+	cursorTop := m.cursorViewportY()
+	assert.Equal(t, cursorTop, m.layout.viewport.YOffset,
+		"YOffset should snap to cursorTop when logical line is taller than viewport")
+}
+
+func TestModel_SyncViewportToCursor_FileAnnotationOverflow(t *testing.T) {
+	// file annotation on a narrow viewport: cursor at -1, multi-line file
+	// annotation that exceeds viewport height. syncViewportToCursor should
+	// keep the annotation's top row visible (the file-annotation branch of
+	// cursorVisualHeight returns the file annotation's row count).
+	m := testModel(nil, nil)
+	m.file.name = "a.go"
+	m.layout.width = 80
+	m.layout.treeWidth = 20
+	m.layout.viewport.Width = 50
+	m.layout.viewport.Height = 2
+
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, Content: "line1", ChangeType: git.ChangeContext},
+	}
+	m.store.Add(annot.Annotation{File: "a.go", Line: 0,
+		Comment: "file-a\nfile-b\nfile-c"})
+
+	fileRows := m.wrappedAnnotationLineCount(annotKeyFile)
+	require.Greater(t, fileRows, m.layout.viewport.Height, "file annotation must exceed viewport height")
+
+	m.nav.diffCursor = -1 // cursor on file annotation line
+	m.layout.viewport.SetContent(m.renderDiff())
+	m.layout.viewport.SetYOffset(5)
+
+	m.syncViewportToCursor()
+
+	// with cursor at top (Y=0) and prior offset=5, first branch fires:
+	// SetYOffset(0) so the file annotation's top row is visible.
+	assert.Equal(t, 0, m.layout.viewport.YOffset,
+		"YOffset should scroll to show the file annotation top row")
+}
+
+func TestModel_SyncViewportToCursor_OnAnnotationSubLineOverflow(t *testing.T) {
+	// cursor parked on annotation sub-line of a tall multi-row annotation:
+	// cursorVisualHeight branches on onAnnotationRow and returns only the
+	// annotation's row count, so scroll keeps the annotation's bottom visible.
+	m := testModel(nil, nil)
+	m.file.name = "a.go"
+	m.layout.width = 80
+	m.layout.treeWidth = 20
+	m.layout.viewport.Width = 50
+	m.layout.viewport.Height = 3
+
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, Content: "line1", ChangeType: git.ChangeContext},
+		{NewNum: 2, Content: "line2", ChangeType: git.ChangeContext},
+	}
+	m.store.Add(annot.Annotation{File: "a.go", Line: 2, Type: " ",
+		Comment: "note-a\nnote-b\nnote-c"})
+
+	annotRows := m.wrappedAnnotationLineCount(m.annotationKey(2, " "))
+	require.Equal(t, 3, annotRows, "annotation should occupy 3 rows")
+
+	m.nav.diffCursor = 1
+	m.nav.onAnnotationRow = true
+	m.layout.viewport.SetContent(m.renderDiff())
+	m.layout.viewport.SetYOffset(0)
+
+	m.syncViewportToCursor()
+
+	cursorTop := m.cursorViewportY()
+	cursorBottom := cursorTop + annotRows - 1
+	expectedOffset := cursorBottom - m.layout.viewport.Height + 1
+	assert.Equal(t, expectedOffset, m.layout.viewport.YOffset,
+		"YOffset should pin the annotation sub-line's visual bottom to the viewport bottom")
+	assert.Less(t, cursorBottom, m.layout.viewport.YOffset+m.layout.viewport.Height,
+		"last annotation row must be visible")
+}
+
+func TestModel_CursorViewportYWithWrapDeletePlaceholder(t *testing.T) {
+	m := testModel(nil, nil)
+	m.file.name = "a.go"
+	m.modes.wrap = true
+	m.modes.collapsed.enabled = true
+	m.modes.collapsed.expandedHunks = make(map[int]bool)
+	m.layout.width = 60
+	m.layout.treeWidth = 20
+
+	// diffContentWidth = 60 - 20 - 4 - 1 = 35, wrapWidth = 35 - 3 = 32
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, Content: "context line", ChangeType: git.ChangeContext},
+		{OldNum: 1, Content: strings.Repeat("x", 80), ChangeType: git.ChangeRemove}, // long remove, hunk start
+		{OldNum: 2, Content: strings.Repeat("y", 80), ChangeType: git.ChangeRemove}, // long remove
+		{OldNum: 3, Content: strings.Repeat("z", 80), ChangeType: git.ChangeRemove}, // long remove
+		{NewNum: 2, Content: "after context", ChangeType: git.ChangeContext},
+	}
+
+	// the "3 lines deleted" placeholder is short (~17 chars), fits in 1 row at wrapWidth=32.
+	// the original removed lines are 80 chars each and would wrap to ~3 rows.
+	// cursorViewportY must use placeholder text (1 row), not original content (~3 rows).
+
+	m.nav.diffCursor = 4 // cursor on "after context" line
+	m.nav.onAnnotationRow = false
+	m.layout.focus = paneDiff
+
+	y := m.cursorViewportY()
+	// expected: 1 (context) + 1 (placeholder = 1 visual row) = 2
+	assert.Equal(t, 2, y, "viewport Y should count placeholder as 1 row, not original line content")
+}
+func TestModel_CursorViewportYWithWrapDeletePlaceholderAndBlame(t *testing.T) {
+	m := testModel(nil, nil)
+	m.file.name = "a.go"
+	m.modes.wrap = true
+	m.modes.collapsed.enabled = true
+	m.modes.collapsed.expandedHunks = make(map[int]bool)
+	m.modes.showBlame = true
+	m.file.blameData = map[int]git.BlameLine{
+		1: {Author: "LongName", Time: time.Now()},
+	}
+	m.file.blameAuthorLen = m.computeBlameAuthorLen()
+	m.layout.width = 25
+	m.layout.treeHidden = true
+
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, Content: "context", ChangeType: git.ChangeContext},
+		{OldNum: 1, Content: strings.Repeat("x", 40), ChangeType: git.ChangeRemove},
+		{OldNum: 2, Content: strings.Repeat("y", 40), ChangeType: git.ChangeRemove},
+		{OldNum: 3, Content: strings.Repeat("z", 40), ChangeType: git.ChangeRemove},
+		{NewNum: 2, Content: "after context", ChangeType: git.ChangeContext},
+	}
+
+	wrapWidth := m.diffContentWidth() - wrapGutterWidth - m.blameGutterWidth()
+	placeholderRows := len(m.wrapContent(m.deletePlaceholderText(1), wrapWidth))
+	require.Greater(t, placeholderRows, 1, "blame gutter should force the placeholder to wrap")
+	contextRows := m.wrappedLineCount(0)
+
+	m.nav.diffCursor = 4
+	m.nav.onAnnotationRow = false
+
+	assert.Equal(t, contextRows+placeholderRows, m.cursorViewportY())
+}
+func TestModel_WrapToggle(t *testing.T) {
+	lines := []git.DiffLine{{ChangeType: git.ChangeContext, Content: "x", NewNum: 1}}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	m.file.name = "a.go"
+	m.file.lines = lines
+	m.file.highlighted = []string{"x"}
+	m.layout.focus = paneDiff
+	m.layout.viewport.Width = 80
+	m.layout.viewport.Height = 20
+	assert.False(t, m.modes.wrap)
+
+	// press w to enable wrap
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	model := result.(Model)
+	assert.True(t, model.modes.wrap)
+
+	// press w again to disable wrap
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	model = result.(Model)
+	assert.False(t, model.modes.wrap)
+}
+func TestModel_WrapToggleResetsScrollX(t *testing.T) {
+	lines := []git.DiffLine{{ChangeType: git.ChangeContext, Content: "x", NewNum: 1}}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	m.file.name = "a.go"
+	m.file.lines = lines
+	m.file.highlighted = []string{"x"}
+	m.layout.focus = paneDiff
+	m.layout.viewport.Width = 80
+	m.layout.viewport.Height = 20
+	m.layout.scrollX = 10
+
+	// enable wrap: scrollX should reset to 0
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	model := result.(Model)
+	assert.True(t, model.modes.wrap)
+	assert.Equal(t, 0, model.layout.scrollX)
+}
+func TestModel_WrapToggleNoOpWithoutFile(t *testing.T) {
+	m := testModel([]string{"a.go"}, nil)
+	m.layout.focus = paneDiff
+	m.file.name = ""
+	assert.False(t, m.modes.wrap)
+
+	// w should be no-op without a loaded file
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	model := result.(Model)
+	assert.False(t, model.modes.wrap)
+}
+func TestModel_WrapToggleNoOpInTreePane(t *testing.T) {
+	lines := []git.DiffLine{{ChangeType: git.ChangeContext, Content: "x", NewNum: 1}}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	m.file.name = "a.go"
+	m.file.lines = lines
+	m.layout.focus = paneTree
+	assert.False(t, m.modes.wrap)
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	model := result.(Model)
+	assert.False(t, model.modes.wrap)
+}
+func TestModel_ScrollBlockedInWrapMode(t *testing.T) {
+	lines := []git.DiffLine{{ChangeType: git.ChangeContext, Content: "x", NewNum: 1}}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	m.file.name = "a.go"
+	m.file.lines = lines
+	m.file.highlighted = []string{"x"}
+	m.layout.focus = paneDiff
+	m.layout.viewport.Width = 80
+	m.layout.viewport.Height = 20
+	m.modes.wrap = true
+	m.layout.scrollX = 0
+
+	// right key should not change scrollX in wrap mode
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model := result.(Model)
+	assert.Equal(t, 0, model.layout.scrollX)
+
+	// left key should not change scrollX in wrap mode
+	model.layout.scrollX = 0
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	model = result.(Model)
+	assert.Equal(t, 0, model.layout.scrollX)
+}
+func TestModel_ScrollWorksWithoutWrapMode(t *testing.T) {
+	wide := strings.Repeat("x", 300) // must overflow the pane, or the clamp correctly refuses to scroll
+	lines := []git.DiffLine{{ChangeType: git.ChangeContext, Content: wide, NewNum: 1}}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	m.file.name = "a.go"
+	m.file.lines = lines
+	m.file.highlighted = []string{wide}
+	m.layout.width = 80
+	m.layout.focus = paneDiff
+	m.layout.viewport.Width = 80
+	m.layout.viewport.Height = 20
+	m.modes.wrap = false
+	m.layout.scrollX = 0
+
+	// right key should scroll in non-wrap mode
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model := result.(Model)
+	assert.Positive(t, model.layout.scrollX)
+}
+func TestModel_CustomKeymapDiffNavNextHunk(t *testing.T) {
+	// map "x" to next_hunk, unbind "]" - verify "x" jumps to next hunk and "]" does not
+	km := keymap.Default()
+	km.Bind("x", keymap.ActionNextHunk)
+	km.Unbind("]")
+
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "ctx", ChangeType: git.ChangeContext},
+		{NewNum: 2, Content: "add", ChangeType: git.ChangeAdd},
+		{NewNum: 3, Content: "ctx2", ChangeType: git.ChangeContext},
+		{NewNum: 4, Content: "add2", ChangeType: git.ChangeAdd},
+	}
+
+	m := testModel(nil, nil)
+	m.keymap = km
+	m.file.lines = lines
+	m.nav.diffCursor = 0
+	m.file.name = "a.go"
+	m.layout.focus = paneDiff
+	m.layout.viewport.Height = 20
+
+	// "x" should jump to next hunk
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	model := result.(Model)
+	assert.Equal(t, 1, model.nav.diffCursor, "x should jump to first hunk")
+
+	// "]" should not jump (unbound)
+	model.nav.diffCursor = 0
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	model = result.(Model)
+	assert.Equal(t, 0, model.nav.diffCursor, "] should not jump when unbound")
+}
+func TestModel_PendingHunkJump_FirstHunk(t *testing.T) {
+	// File b.go has two hunks: divider, context, add, context, add
+	bLines := []git.DiffLine{
+		{ChangeType: git.ChangeDivider},
+		{ChangeType: git.ChangeContext, Content: "ctx1", NewNum: 1},
+		{ChangeType: git.ChangeAdd, Content: "add1", NewNum: 2},
+		{ChangeType: git.ChangeContext, Content: "ctx2", NewNum: 3},
+		{ChangeType: git.ChangeAdd, Content: "add2", NewNum: 4},
+	}
+	diffs := map[string][]git.DiffLine{
+		"a.go": {{ChangeType: git.ChangeContext, Content: "ctx", NewNum: 1}},
+		"b.go": bLines,
+	}
+	m := testModel([]string{"a.go", "b.go"}, diffs)
+	result, _ := m.Update(filesLoadedMsg{entries: []git.FileEntry{{Path: "a.go"}, {Path: "b.go"}}})
+	m = result.(Model)
+	msg := m.loadFileDiff("a.go")()
+	result, _ = m.Update(msg)
+	m = result.(Model)
+
+	// set pendingHunkJump = true (first hunk)
+	fwd := true
+	m.nav.pendingHunkJump = &fwd
+	m.file.loadSeq++
+	loadMsg := fileLoadedMsg{file: "b.go", seq: m.file.loadSeq, lines: bLines}
+	result, _ = m.Update(loadMsg)
+	model := result.(Model)
+
+	assert.Nil(t, model.nav.pendingHunkJump, "pendingHunkJump should be cleared after file load")
+	assert.Equal(t, 2, model.nav.diffCursor, "cursor should land on first hunk (index 2, the add line)")
+}
+func TestModel_PendingHunkJump_LastHunk(t *testing.T) {
+	// File b.go has two hunks
+	bLines := []git.DiffLine{
+		{ChangeType: git.ChangeDivider},
+		{ChangeType: git.ChangeContext, Content: "ctx1", NewNum: 1},
+		{ChangeType: git.ChangeAdd, Content: "add1", NewNum: 2},
+		{ChangeType: git.ChangeContext, Content: "ctx2", NewNum: 3},
+		{ChangeType: git.ChangeAdd, Content: "add2", NewNum: 4},
+	}
+	diffs := map[string][]git.DiffLine{
+		"a.go": {{ChangeType: git.ChangeContext, Content: "ctx", NewNum: 1}},
+		"b.go": bLines,
+	}
+	m := testModel([]string{"a.go", "b.go"}, diffs)
+	result, _ := m.Update(filesLoadedMsg{entries: []git.FileEntry{{Path: "a.go"}, {Path: "b.go"}}})
+	m = result.(Model)
+	msg := m.loadFileDiff("a.go")()
+	result, _ = m.Update(msg)
+	m = result.(Model)
+
+	// set pendingHunkJump = false (last hunk)
+	bwd := false
+	m.nav.pendingHunkJump = &bwd
+	m.file.loadSeq++
+	loadMsg := fileLoadedMsg{file: "b.go", seq: m.file.loadSeq, lines: bLines}
+	result, _ = m.Update(loadMsg)
+	model := result.(Model)
+
+	assert.Nil(t, model.nav.pendingHunkJump, "pendingHunkJump should be cleared after file load")
+	assert.Equal(t, 4, model.nav.diffCursor, "cursor should land on last hunk (index 4, the second add line)")
+}
+func TestModel_PendingHunkJump_ClearedOnManualNav(t *testing.T) {
+	diffs := map[string][]git.DiffLine{
+		"a.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+		"b.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+	}
+	m := testModel([]string{"a.go", "b.go"}, diffs)
+	result, _ := m.Update(filesLoadedMsg{entries: []git.FileEntry{{Path: "a.go"}, {Path: "b.go"}}})
+	m = result.(Model)
+	msg := m.loadFileDiff("a.go")()
+	result, _ = m.Update(msg)
+	m = result.(Model)
+
+	// set pendingHunkJump then trigger manual tree navigation (j key from tree pane)
+	fwd := true
+	m.nav.pendingHunkJump = &fwd
+	m.layout.focus = paneTree
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	model := result.(Model)
+	assert.Nil(t, model.nav.pendingHunkJump, "pendingHunkJump should be cleared on manual tree navigation")
+}
+
+// loadFileIntoModel sets up a model with files loaded and a.go as the current file.
+func loadFileIntoModel(t *testing.T, files []string, diffs map[string][]git.DiffLine) Model {
+	t.Helper()
+	m := testModel(files, diffs)
+	entries := make([]git.FileEntry, len(files))
+	for i, f := range files {
+		entries[i] = git.FileEntry{Path: f}
+	}
+	result, _ := m.Update(filesLoadedMsg{entries: entries})
+	m = result.(Model)
+	loadMsg := m.loadFileDiff(files[0])()
+	result, _ = m.Update(loadMsg)
+	m = result.(Model)
+	m.layout.viewport.Height = 20
+	return m
+}
+func TestModel_HunkNav_FromTreePane_SwitchesFocusToDiff(t *testing.T) {
+	// pressing ] from tree pane should switch focus to diff and jump to first hunk
+	diffs := map[string][]git.DiffLine{
+		"a.go": {
+			{ChangeType: git.ChangeContext, Content: "ctx", NewNum: 1},
+			{ChangeType: git.ChangeAdd, Content: "add", NewNum: 2},
+		},
+	}
+	m := loadFileIntoModel(t, []string{"a.go"}, diffs)
+	m.layout.focus = paneTree
+	m.nav.diffCursor = 0 // on context line
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	model := result.(Model)
+
+	assert.Equal(t, paneDiff, model.layout.focus, "] from tree pane should switch focus to diff")
+	assert.Equal(t, 1, model.nav.diffCursor, "] should land on the add line (hunk start)")
+}
+func TestModel_HunkNav_PrevFromTreePane_SwitchesFocusToDiff(t *testing.T) {
+	// pressing [ from tree pane should switch focus to diff and jump to prev hunk
+	diffs := map[string][]git.DiffLine{
+		"a.go": {
+			{ChangeType: git.ChangeAdd, Content: "add1", NewNum: 1},
+			{ChangeType: git.ChangeContext, Content: "ctx", NewNum: 2},
+			{ChangeType: git.ChangeAdd, Content: "add2", NewNum: 3},
+		},
+	}
+	m := loadFileIntoModel(t, []string{"a.go"}, diffs)
+	m.layout.focus = paneTree
+	m.nav.diffCursor = 2 // on second add line
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'['}})
+	model := result.(Model)
+
+	assert.Equal(t, paneDiff, model.layout.focus, "[ from tree pane should switch focus to diff")
+	assert.Equal(t, 0, model.nav.diffCursor, "[ should land on first hunk start (index 0)")
+}
+func TestModel_HunkNav_NextCrossesFileForward(t *testing.T) {
+	// pressing ] at the last hunk of a.go should navigate to b.go and set pendingHunkJump=true
+	diffs := map[string][]git.DiffLine{
+		"a.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+		"b.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+	}
+	m := loadFileIntoModel(t, []string{"a.go", "b.go"}, diffs)
+	m.session.crossFileHunks = true
+	m.layout.focus = paneDiff
+	m.nav.diffCursor = 0 // at the only (last) hunk
+
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	model := result.(Model)
+
+	require.NotNil(t, model.nav.pendingHunkJump, "pendingHunkJump should be set for cross-file forward jump")
+	assert.True(t, *model.nav.pendingHunkJump, "pendingHunkJump should be true (land on first hunk)")
+	assert.Equal(t, "b.go", model.tree.SelectedFile(), "tree should have advanced to b.go")
+	assert.NotNil(t, cmd, "a load command should be returned")
+}
+func TestModel_HunkNav_PrevCrossesFileBackward(t *testing.T) {
+	// pressing [ at the first hunk of b.go should navigate to a.go and set pendingHunkJump=false
+	diffs := map[string][]git.DiffLine{
+		"a.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+		"b.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+	}
+	m := loadFileIntoModel(t, []string{"a.go", "b.go"}, diffs)
+	m.session.crossFileHunks = true
+	// select b.go in tree (index 0 = dir entry, index 1 = a.go, index 2 = b.go)
+	m.tree.SelectByPath("b.go")
+	m.file.loadSeq++
+	bLoad := m.loadFileDiff("b.go")()
+	result, _ := m.Update(bLoad)
+	m = result.(Model)
+	m.layout.viewport.Height = 20
+	m.layout.focus = paneDiff
+	m.nav.diffCursor = 0 // at the first (and only) hunk
+
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'['}})
+	model := result.(Model)
+
+	require.NotNil(t, model.nav.pendingHunkJump, "pendingHunkJump should be set for cross-file backward jump")
+	assert.False(t, *model.nav.pendingHunkJump, "pendingHunkJump should be false (land on last hunk)")
+	assert.Equal(t, "a.go", model.tree.SelectedFile(), "tree should have moved back to a.go")
+	assert.NotNil(t, cmd, "a load command should be returned")
+}
+func TestModel_HunkNav_NextAtLastFileNoOp(t *testing.T) {
+	// pressing ] at the last hunk of the last file: no-op
+	diffs := map[string][]git.DiffLine{
+		"a.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+	}
+	m := loadFileIntoModel(t, []string{"a.go"}, diffs)
+	m.layout.focus = paneDiff
+	m.nav.diffCursor = 0
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	model := result.(Model)
+
+	assert.Nil(t, model.nav.pendingHunkJump, "no pendingHunkJump when no next file")
+	assert.Equal(t, 0, model.nav.diffCursor, "cursor should stay at last hunk")
+	assert.Equal(t, "a.go", model.file.name, "should remain on a.go")
+}
+func TestModel_HunkNav_PrevAtFirstFileNoOp(t *testing.T) {
+	// pressing [ at the first hunk of the first file: no-op
+	diffs := map[string][]git.DiffLine{
+		"a.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+	}
+	m := loadFileIntoModel(t, []string{"a.go"}, diffs)
+	m.layout.focus = paneDiff
+	m.nav.diffCursor = 0
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'['}})
+	model := result.(Model)
+
+	assert.Nil(t, model.nav.pendingHunkJump, "no pendingHunkJump when no prev file")
+	assert.Equal(t, 0, model.nav.diffCursor, "cursor should stay at first hunk")
+	assert.Equal(t, "a.go", model.file.name, "should remain on a.go")
+}
+func TestModel_HunkNav_SingleFileNoCrossFile(t *testing.T) {
+	// in single-file mode, ] at last hunk should not cross to other files
+	diffs := map[string][]git.DiffLine{
+		"a.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+	}
+	m := loadFileIntoModel(t, []string{"a.go"}, diffs)
+	m.session.crossFileHunks = true
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.focus = paneDiff
+	m.nav.diffCursor = 0
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	model := result.(Model)
+
+	assert.Nil(t, model.nav.pendingHunkJump, "single-file mode should not set pendingHunkJump")
+	assert.Equal(t, 0, model.nav.diffCursor, "cursor should not move in single-file mode at last hunk")
+}
+func TestModel_HunkNav_CrossFile_LandsOnFirstHunk(t *testing.T) {
+	// end-to-end: ] from last hunk of a.go loads b.go and lands on its first hunk
+	bLines := []git.DiffLine{
+		{ChangeType: git.ChangeDivider},
+		{ChangeType: git.ChangeContext, Content: "ctx", NewNum: 1},
+		{ChangeType: git.ChangeAdd, Content: "add1", NewNum: 2},
+		{ChangeType: git.ChangeContext, Content: "ctx2", NewNum: 3},
+		{ChangeType: git.ChangeAdd, Content: "add2", NewNum: 4},
+	}
+	diffs := map[string][]git.DiffLine{
+		"a.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+		"b.go": bLines,
+	}
+	m := loadFileIntoModel(t, []string{"a.go", "b.go"}, diffs)
+	m.session.crossFileHunks = true
+	m.layout.focus = paneDiff
+	m.nav.diffCursor = 0 // at the only hunk of a.go
+
+	// press ] to trigger cross-file jump
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	m = result.(Model)
+	require.NotNil(t, cmd, "should have a load command")
+
+	// execute the load command and process the result
+	loadMsg := cmd()
+	result, _ = m.Update(loadMsg)
+	model := result.(Model)
+
+	assert.Nil(t, model.nav.pendingHunkJump, "pendingHunkJump should be cleared after landing")
+	assert.Equal(t, "b.go", model.file.name, "should have navigated to b.go")
+	assert.Equal(t, 2, model.nav.diffCursor, "should land on first hunk of b.go (index 2)")
+}
+func TestModel_HunkNav_CrossFile_LandsOnLastHunk(t *testing.T) {
+	// end-to-end: [ from first hunk of b.go loads a.go and lands on its last hunk
+	aLines := []git.DiffLine{
+		{ChangeType: git.ChangeAdd, Content: "add1", NewNum: 1},
+		{ChangeType: git.ChangeContext, Content: "ctx", NewNum: 2},
+		{ChangeType: git.ChangeAdd, Content: "add2", NewNum: 3},
+	}
+	diffs := map[string][]git.DiffLine{
+		"a.go": aLines,
+		"b.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+	}
+	m := loadFileIntoModel(t, []string{"a.go", "b.go"}, diffs)
+	m.session.crossFileHunks = true
+	// select b.go in tree (index 0 = dir entry, index 1 = a.go, index 2 = b.go)
+	m.tree.SelectByPath("b.go")
+	m.file.loadSeq++
+	loadMsg := m.loadFileDiff("b.go")()
+	result, _ := m.Update(loadMsg)
+	m = result.(Model)
+	m.layout.viewport.Height = 20
+	m.layout.focus = paneDiff
+	m.nav.diffCursor = 0 // at first (only) hunk of b.go
+
+	// press [ to trigger cross-file backward jump
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'['}})
+	m = result.(Model)
+	require.NotNil(t, cmd, "should have a load command")
+
+	// execute the load command and process the result
+	loadMsg = cmd()
+	result, _ = m.Update(loadMsg)
+	model := result.(Model)
+
+	assert.Nil(t, model.nav.pendingHunkJump, "pendingHunkJump should be cleared after landing")
+	assert.Equal(t, "a.go", model.file.name, "should have navigated to a.go")
+	assert.Equal(t, 2, model.nav.diffCursor, "should land on last hunk of a.go (index 2)")
+}
+func TestModel_HunkNav_DefaultDoesNotCrossFiles(t *testing.T) {
+	diffs := map[string][]git.DiffLine{
+		"a.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+		"b.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+	}
+	m := loadFileIntoModel(t, []string{"a.go", "b.go"}, diffs)
+	m.layout.focus = paneDiff
+	m.nav.diffCursor = 0
+
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	model := result.(Model)
+
+	assert.Nil(t, cmd)
+	assert.Nil(t, model.nav.pendingHunkJump)
+	assert.Equal(t, "a.go", model.file.name)
+	assert.Equal(t, "a.go", model.tree.SelectedFile())
+	assert.Equal(t, 0, model.nav.diffCursor)
+}
+func TestModel_PendingHunkJump_FallsBackToFirstVisibleLineWithoutHunks(t *testing.T) {
+	lines := []git.DiffLine{
+		{ChangeType: git.ChangeDivider},
+		{ChangeType: git.ChangeContext, Content: "ctx1", NewNum: 1},
+		{ChangeType: git.ChangeContext, Content: "ctx2", NewNum: 2},
+	}
+	diffs := map[string][]git.DiffLine{
+		"a.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+		"b.go": lines,
+	}
+	m := testModel([]string{"a.go", "b.go"}, diffs)
+	result, _ := m.Update(filesLoadedMsg{entries: []git.FileEntry{{Path: "a.go"}, {Path: "b.go"}}})
+	m = result.(Model)
+	msg := m.loadFileDiff("a.go")()
+	result, _ = m.Update(msg)
+	m = result.(Model)
+
+	fwd := true
+	m.nav.pendingHunkJump = &fwd
+	m.file.loadSeq++
+	loadMsg := fileLoadedMsg{file: "b.go", seq: m.file.loadSeq, lines: lines}
+	result, _ = m.Update(loadMsg)
+	model := result.(Model)
+
+	assert.Nil(t, model.nav.pendingHunkJump)
+	assert.Equal(t, 1, model.nav.diffCursor, "should fall back to first visible context line")
+}
+func TestModel_PendingHunkJump_ClearedWhenPendingAnnotJumpLands(t *testing.T) {
+	diffs := map[string][]git.DiffLine{
+		"a.go": {{ChangeType: git.ChangeContext, Content: "ctx", NewNum: 1}},
+		"b.go": {{ChangeType: git.ChangeAdd, Content: "add", NewNum: 1}},
+	}
+	m := testModel([]string{"a.go", "b.go"}, diffs)
+	result, _ := m.Update(filesLoadedMsg{entries: []git.FileEntry{{Path: "a.go"}, {Path: "b.go"}}})
+	m = result.(Model)
+	msg := m.loadFileDiff("a.go")()
+	result, _ = m.Update(msg)
+	m = result.(Model)
+
+	fwd := true
+	m.nav.pendingHunkJump = &fwd
+	m.pendingAnnotJump = &annot.Annotation{File: "b.go", Line: 1, Type: "+", Comment: "note"}
+	m.file.loadSeq++
+	loadMsg := fileLoadedMsg{file: "b.go", seq: m.file.loadSeq, lines: diffs["b.go"]}
+	result, _ = m.Update(loadMsg)
+	model := result.(Model)
+
+	assert.Nil(t, model.pendingAnnotJump)
+	assert.Nil(t, model.nav.pendingHunkJump)
+	assert.Equal(t, 0, model.nav.diffCursor)
+}
+
+func TestModel_EnterInDiffPaneOnDividerIgnored(t *testing.T) {
+	lines := []git.DiffLine{
+		{Content: "--- a/file.go", ChangeType: git.ChangeDivider},
+		{NewNum: 1, Content: "line1", ChangeType: git.ChangeContext},
+	}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	m.tree = testNewFileTree([]string{"a.go"})
+	m.layout.focus = paneDiff
+	m.file.name = "a.go"
+	m.file.lines = lines
+	m.nav.diffCursor = 0 // on divider line
+
+	// press enter on divider - should not enter annotation mode
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model := result.(Model)
+	assert.False(t, model.annot.annotating, "enter on divider should not start annotation")
+}
+
+func TestModel_DiffLineNum(t *testing.T) {
+	m := testModel(nil, nil)
+	assert.Equal(t, 5, m.diffLineNum(git.DiffLine{NewNum: 5, ChangeType: git.ChangeContext}))
+	assert.Equal(t, 3, m.diffLineNum(git.DiffLine{NewNum: 3, ChangeType: git.ChangeAdd}))
+	assert.Equal(t, 7, m.diffLineNum(git.DiffLine{OldNum: 7, ChangeType: git.ChangeRemove}))
+}
+
+func TestBottomAlignViewportOnCursor_PlacesCursorAtBottom(t *testing.T) {
+	lines := make([]git.DiffLine, 100)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	model.nav.diffCursor = 50
+
+	model.bottomAlignViewportOnCursor()
+	pageHeight := model.layout.viewport.Height
+	require.Positive(t, pageHeight)
+
+	cursorY := model.cursorViewportY()
+	assert.Equal(t, pageHeight-1, cursorY-model.layout.viewport.YOffset,
+		"cursor should be at visual row pageHeight-1 (bottom row)")
+}
+
+func TestBottomAlignViewportOnCursor_ShortFile(t *testing.T) {
+	// diff much shorter than viewport - offset must clamp at 0, no scrolling
+	lines := make([]git.DiffLine, 5)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	model.nav.diffCursor = 2
+
+	model.bottomAlignViewportOnCursor()
+	assert.Equal(t, 0, model.layout.viewport.YOffset,
+		"short file should leave offset at 0 (no scroll needed)")
+}
+
+func TestJumpToLineN_WithinBounds(t *testing.T) {
+	lines := make([]git.DiffLine, 100)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	model.jumpToLineN(50)
+	assert.Equal(t, 49, model.nav.diffCursor, "jumpToLineN(50) should place cursor at index 49 (1-indexed → 0-indexed)")
+	assert.False(t, model.nav.onAnnotationRow, "jump should clear onAnnotationRow")
+}
+
+func TestJumpToLineN_ClampsLow(t *testing.T) {
+	lines := make([]git.DiffLine, 50)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	model.nav.diffCursor = 25
+
+	model.jumpToLineN(0)
+	assert.Equal(t, 0, model.nav.diffCursor, "jumpToLineN(0) should clamp to first line")
+
+	model.nav.diffCursor = 25
+	model.jumpToLineN(-10)
+	assert.Equal(t, 0, model.nav.diffCursor, "jumpToLineN(-10) should clamp to first line")
+}
+
+func TestJumpToLineN_ClampsHigh(t *testing.T) {
+	lines := make([]git.DiffLine, 50)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	model.jumpToLineN(99999)
+	assert.Equal(t, 49, model.nav.diffCursor, "jumpToLineN(99999) should clamp to last line (index 49)")
+}
+
+func TestJumpToLineN_EmptyDiff(t *testing.T) {
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": nil})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	model.layout.focus = paneDiff
+	model.nav.diffCursor = 3
+	before := model.nav.diffCursor
+
+	assert.NotPanics(t, func() { model.jumpToLineN(5) })
+	assert.Equal(t, before, model.nav.diffCursor, "empty diff should leave cursor unchanged")
+}
+
+func TestJumpToLineN_CollapsedModeSkipsHiddenLine(t *testing.T) {
+	// target line is a hidden removed line in collapsed mode. jumpToLineN must
+	// nudge the cursor to the nearest visible line so users never land on an
+	// invisible row when pressing G or <N>G.
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "ctx1", ChangeType: git.ChangeContext}, // idx 0, line 1
+		{OldNum: 2, Content: "old1", ChangeType: git.ChangeRemove},  // idx 1, line 2 - hidden
+		{OldNum: 3, Content: "old2", ChangeType: git.ChangeRemove},  // idx 2, line 3 - hidden
+		{NewNum: 2, Content: "new1", ChangeType: git.ChangeAdd},     // idx 3, line 4
+		{NewNum: 3, Content: "ctx2", ChangeType: git.ChangeContext}, // idx 4, line 5
+	}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	model.modes.collapsed.enabled = true
+	model.nav.diffCursor = 0
+
+	// line 2 is a hidden removed line. must nudge forward to the add line (idx 3)
+	model.jumpToLineN(2)
+	assert.Equal(t, 3, model.nav.diffCursor, "hidden removed line must nudge to nearest visible line")
+}
+
+func TestJumpToLineN_CollapsedModeVisibleLineStays(t *testing.T) {
+	// target line is already visible in collapsed mode. cursor must land exactly
+	// on the requested line without adjustment.
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "ctx1", ChangeType: git.ChangeContext}, // idx 0
+		{OldNum: 2, Content: "old1", ChangeType: git.ChangeRemove},  // idx 1 - hidden
+		{NewNum: 2, Content: "new1", ChangeType: git.ChangeAdd},     // idx 2 - visible
+		{NewNum: 3, Content: "ctx2", ChangeType: git.ChangeContext}, // idx 3
+	}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	model.modes.collapsed.enabled = true
+	model.nav.diffCursor = 0
+
+	model.jumpToLineN(3) // line 3 = idx 2, the add line, visible
+	assert.Equal(t, 2, model.nav.diffCursor, "visible target line must not be adjusted")
+}
+
+// screenMotionModel builds a diff-focused model with n single-row context lines
+// and a sized viewport, for exercising the H/M/L screen-position motions.
+func screenMotionModel(t *testing.T, n int) Model {
+	t.Helper()
+	lines := make([]git.DiffLine, n)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	return model
+}
+
+func TestMoveDiffCursorToScreenTop_Placement(t *testing.T) {
+	m := screenMotionModel(t, 200)
+	m.layout.viewport.SetYOffset(50)
+	yoff := m.layout.viewport.YOffset
+
+	m.moveDiffCursorToScreenTop(0)
+	assert.Equal(t, yoff, m.nav.diffCursor, "H with no count lands on the top visible line")
+
+	m.moveDiffCursorToScreenTop(5)
+	assert.Equal(t, yoff+4, m.nav.diffCursor, "5H lands on the 5th line from the top")
+	assert.Equal(t, yoff, m.layout.viewport.YOffset, "screen motion must not scroll the viewport")
+}
+
+func TestMoveDiffCursorToScreenMiddle_OddEvenHeight(t *testing.T) {
+	tests := []struct {
+		name         string
+		height, want int
+	}{
+		{"even height", 10, 5},
+		{"odd height", 9, 4},
+		{"full window", 40, 20},
+		{"height one", 1, 0},
+		{"height zero", 0, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := screenMotionModel(t, 200)
+			m.layout.viewport.SetYOffset(0)
+			m.layout.viewport.Height = tc.height
+			m.moveDiffCursorToScreenMiddle()
+			assert.Equal(t, tc.want, m.nav.diffCursor, "M lands on the middle visible line (YOffset 0 + Height/2)")
+		})
+	}
+}
+
+func TestMoveDiffCursorToScreenBottom_Placement(t *testing.T) {
+	m := screenMotionModel(t, 200)
+	m.layout.viewport.SetYOffset(50)
+	yoff := m.layout.viewport.YOffset
+	h := m.layout.viewport.Height
+
+	m.moveDiffCursorToScreenBottom(0)
+	assert.Equal(t, yoff+h-1, m.nav.diffCursor, "L with no count lands on the bottom visible line")
+
+	m.moveDiffCursorToScreenBottom(3)
+	assert.Equal(t, yoff+h-3, m.nav.diffCursor, "3L lands on the 3rd line from the bottom")
+	assert.Equal(t, yoff, m.layout.viewport.YOffset, "screen motion must not scroll the viewport")
+}
+
+func TestMoveDiffCursorToScreenBottom_CountBeyondTopClamps(t *testing.T) {
+	// a count taller than the viewport must clamp the target row to the top of the
+	// screen, not underflow above it.
+	m := screenMotionModel(t, 200)
+	m.layout.viewport.SetYOffset(50)
+	yoff := m.layout.viewport.YOffset
+
+	m.moveDiffCursorToScreenBottom(100000)
+	assert.Equal(t, yoff, m.nav.diffCursor, "huge count clamps L to the top visible line")
+}
+
+func TestMoveDiffCursorToScreen_EmptyDiff(t *testing.T) {
+	m := screenMotionModel(t, 0)
+	m.nav.diffCursor = 3
+	before := m.nav.diffCursor
+
+	assert.NotPanics(t, func() {
+		m.moveDiffCursorToScreenTop(2)
+		m.moveDiffCursorToScreenMiddle()
+		m.moveDiffCursorToScreenBottom(2)
+	})
+	assert.Equal(t, before, m.nav.diffCursor, "empty diff leaves the cursor unchanged")
+}
+
+func TestMoveDiffCursorToScreenTop_CountBeyondBottomClamps(t *testing.T) {
+	// a count taller than the viewport must clamp H to the last visible row, not
+	// select an off-screen row below the window (symmetry with L's clamp).
+	m := screenMotionModel(t, 200)
+	m.layout.viewport.SetYOffset(50)
+	yoff := m.layout.viewport.YOffset
+	h := m.layout.viewport.Height
+
+	m.moveDiffCursorToScreenTop(100000)
+	assert.Equal(t, yoff+h-1, m.nav.diffCursor, "huge count clamps H to the last visible line")
+	assert.Equal(t, yoff, m.layout.viewport.YOffset, "clamped H must not scroll the viewport")
+}
+
+func TestMoveDiffCursorToScreen_ZeroHeight(t *testing.T) {
+	// degenerate viewport height must not panic in the height-derived row math.
+	m := screenMotionModel(t, 50)
+	m.layout.viewport.SetYOffset(0)
+	m.layout.viewport.Height = 0
+
+	assert.NotPanics(t, func() {
+		m.moveDiffCursorToScreenTop(3)
+		m.moveDiffCursorToScreenMiddle()
+		m.moveDiffCursorToScreenBottom(3)
+	})
+}
+
+func TestMoveDiffCursorToScreenTop_CountClampOntoBottomDividerStaysInViewport(t *testing.T) {
+	// a large H count clamps to the bottom visible row. if that row is a divider
+	// the nudge must move toward the window interior (backward), not push below
+	// the window and scroll.
+	m := screenMotionModel(t, 200)
+	m.layout.viewport.SetYOffset(50)
+	yoff := m.layout.viewport.YOffset
+	h := m.layout.viewport.Height
+	m.file.lines[yoff+h-1].ChangeType = git.ChangeDivider // bottom visible row
+
+	m.moveDiffCursorToScreenTop(100000)
+	assert.GreaterOrEqual(t, m.nav.diffCursor, yoff, "cursor must stay at or below the window top")
+	assert.Less(t, m.nav.diffCursor, yoff+h, "cursor must stay within the visible window")
+	assert.NotEqual(t, git.ChangeDivider, m.file.lines[m.nav.diffCursor].ChangeType, "cursor must not rest on a divider")
+	assert.Equal(t, yoff, m.layout.viewport.YOffset, "clamped H onto a bottom-edge divider must not scroll")
+}
+
+func TestMoveDiffCursorToScreenBottom_CountClampOntoTopDividerStaysInViewport(t *testing.T) {
+	// a large L count clamps to the top visible row. if that row is a divider the
+	// nudge must move toward the window interior (forward), not push above the
+	// window and scroll.
+	m := screenMotionModel(t, 200)
+	m.layout.viewport.SetYOffset(50)
+	yoff := m.layout.viewport.YOffset
+	h := m.layout.viewport.Height
+	m.file.lines[yoff].ChangeType = git.ChangeDivider // top visible row
+
+	m.moveDiffCursorToScreenBottom(100000)
+	assert.GreaterOrEqual(t, m.nav.diffCursor, yoff, "cursor must not nudge above the window top")
+	assert.Less(t, m.nav.diffCursor, yoff+h, "cursor must stay within the visible window")
+	assert.NotEqual(t, git.ChangeDivider, m.file.lines[m.nav.diffCursor].ChangeType, "cursor must not rest on a divider")
+	assert.Equal(t, yoff, m.layout.viewport.YOffset, "clamped L onto a top-edge divider must not scroll")
+}
+
+func TestJumpToLineN_NudgesOffDivider(t *testing.T) {
+	// G / <N>G landing on a divider must nudge off it (the refactor routes this
+	// through the shared nudgeCursorOffDivider before adjustCursorIfHidden).
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "a", ChangeType: git.ChangeContext}, // idx 0
+		{Content: "⋯", ChangeType: git.ChangeDivider},            // idx 1
+		{NewNum: 2, Content: "b", ChangeType: git.ChangeContext}, // idx 2
+	}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+
+	model.jumpToLineN(2) // idx 1 = divider, nudge (backward-first) off it
+	assert.NotEqual(t, git.ChangeDivider, model.file.lines[model.nav.diffCursor].ChangeType,
+		"jumpToLineN must not leave the cursor on a divider")
+	assert.Equal(t, 0, model.nav.diffCursor, "backward-first nudge lands on the preceding line")
+}
+
+func TestMoveDiffCursorToScreenTop_StaysInViewportOnDivider(t *testing.T) {
+	// H targets the top visible row. when that row is a divider the cursor must
+	// nudge forward into the viewport, not backward above YOffset (which would
+	// scroll the page)..
+	m := screenMotionModel(t, 200)
+	m.layout.viewport.SetYOffset(55)
+	yoff := m.layout.viewport.YOffset
+	h := m.layout.viewport.Height
+	m.file.lines[yoff].ChangeType = git.ChangeDivider
+
+	m.moveDiffCursorToScreenTop(0)
+	assert.Equal(t, yoff+1, m.nav.diffCursor, "H on a top-row divider nudges forward to the next line")
+	assert.NotEqual(t, git.ChangeDivider, m.file.lines[m.nav.diffCursor].ChangeType, "cursor must not rest on a divider")
+	assert.GreaterOrEqual(t, m.nav.diffCursor, yoff, "cursor must not nudge above the viewport top")
+	assert.Less(t, m.nav.diffCursor, yoff+h, "cursor must stay within the visible window")
+	assert.Equal(t, yoff, m.layout.viewport.YOffset, "screen motion must not scroll the viewport")
+}
+
+func TestMoveDiffCursorToScreenTop_OnAnnotationRow(t *testing.T) {
+	// when the targeted top row is an injected annotation sub-line, the cursor
+	// must report onAnnotationRow so edits and the highlight target the
+	// annotation rather than its parent diff line.
+	m := screenMotionModel(t, 200)
+	m.store.Add(annot.Annotation{File: "a.go", Line: 1, Type: string(git.ChangeContext), Comment: "note"})
+	result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: m.file.lines})
+	m = result.(Model)
+	// content row 0 is diff line 0. row 1 is its annotation sub-line.
+	m.layout.viewport.SetYOffset(1)
+
+	m.moveDiffCursorToScreenTop(0)
+	assert.Equal(t, 0, m.nav.diffCursor, "H targets the annotation's parent diff line")
+	assert.True(t, m.nav.onAnnotationRow, "H on an annotation sub-row must set onAnnotationRow")
+}
+
+func TestNudgeCursorOffDivider_Direction(t *testing.T) {
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "a", ChangeType: git.ChangeContext}, // idx 0
+		{Content: "⋯", ChangeType: git.ChangeDivider},            // idx 1
+		{NewNum: 2, Content: "b", ChangeType: git.ChangeContext}, // idx 2
+	}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+
+	model.nav.diffCursor = 1
+	model.nudgeCursorOffDivider(true)
+	assert.Equal(t, 2, model.nav.diffCursor, "preferForward nudges down off the divider")
+
+	model.nav.diffCursor = 1
+	model.nudgeCursorOffDivider(false)
+	assert.Equal(t, 0, model.nav.diffCursor, "backward-first nudges up off the divider")
+}
+
+func TestNudgeCursorOffDivider_FallbackOppositeDirection(t *testing.T) {
+	// preferForward, but the only non-divider line is behind the cursor: the
+	// search must fall back to the opposite direction.
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "a", ChangeType: git.ChangeContext}, // idx 0
+		{Content: "⋯", ChangeType: git.ChangeDivider},            // idx 1
+		{Content: "⋯", ChangeType: git.ChangeDivider},            // idx 2
+	}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+
+	model.nav.diffCursor = 2
+	model.nudgeCursorOffDivider(true) // no non-divider forward, fall back to idx 0
+	assert.Equal(t, 0, model.nav.diffCursor, "forward search falls back to the backward non-divider line")
+}
+
+func TestHandleDiffAction_ScrollCenter(t *testing.T) {
+	lines := make([]git.DiffLine, 100)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	model.nav.diffCursor = 50
+	model.layout.viewport.SetYOffset(0)
+
+	newModel, cmd := model.handleDiffAction(keymap.ActionScrollCenter)
+	got := newModel.(Model)
+	assert.Nil(t, cmd)
+	pageHeight := got.layout.viewport.Height
+	require.Positive(t, pageHeight)
+	expected := max(0, got.cursorViewportY()-pageHeight/2)
+	assert.Equal(t, expected, got.layout.viewport.YOffset, "scroll_center should center cursor in viewport")
+	assert.Equal(t, 50, got.nav.diffCursor, "scroll action must not move cursor")
+}
+
+func TestHandleDiffAction_ScrollTop(t *testing.T) {
+	lines := make([]git.DiffLine, 100)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	model.nav.diffCursor = 50
+	model.layout.viewport.SetYOffset(0)
+
+	newModel, cmd := model.handleDiffAction(keymap.ActionScrollTop)
+	got := newModel.(Model)
+	assert.Nil(t, cmd)
+	cursorY := got.cursorViewportY()
+	assert.Equal(t, max(0, cursorY), got.layout.viewport.YOffset, "scroll_top should place cursor at top of viewport")
+	assert.Equal(t, 50, got.nav.diffCursor, "scroll action must not move cursor")
+}
+
+func TestHandleDiffAction_ScrollBottom(t *testing.T) {
+	lines := make([]git.DiffLine, 100)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	model.nav.diffCursor = 50
+	model.layout.viewport.SetYOffset(0)
+
+	newModel, cmd := model.handleDiffAction(keymap.ActionScrollBottom)
+	got := newModel.(Model)
+	assert.Nil(t, cmd)
+	pageHeight := got.layout.viewport.Height
+	require.Positive(t, pageHeight)
+	cursorY := got.cursorViewportY()
+	expected := max(0, cursorY-pageHeight+1)
+	assert.Equal(t, expected, got.layout.viewport.YOffset, "scroll_bottom should place cursor on last visible row")
+	assert.Equal(t, 50, got.nav.diffCursor, "scroll action must not move cursor")
+}
+
+// J/K scroll the diff viewport by 2 lines regardless of which pane holds focus,
+// without moving focus or changing the tree selection.
+func TestModel_JKScrollsDiffViewport(t *testing.T) {
+	lines := make([]git.DiffLine, 200)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	focusCases := []struct {
+		name  string
+		focus pane
+	}{
+		{"tree focused", paneTree},
+		{"diff focused", paneDiff},
+	}
+	for _, tc := range focusCases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := testModel([]string{"a.go", "b.go"}, map[string][]git.DiffLine{"a.go": lines})
+			result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+			model := result.(Model)
+			result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+			model = result.(Model)
+			model.tree = testNewFileTree([]string{"a.go", "b.go"})
+			model.layout.focus = tc.focus
+
+			require.Equal(t, 0, model.layout.viewport.YOffset)
+			require.Equal(t, "a.go", model.tree.SelectedFile())
+
+			// Shift+J scrolls the diff viewport down by one wheel step.
+			result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'J'}})
+			model = result.(Model)
+			assert.Equal(t, wheelStep, model.layout.viewport.YOffset, "J should scroll diff viewport down one wheel step")
+			assert.Equal(t, wheelStep, model.nav.diffCursor, "cursor must be pinned into view at the new viewport top")
+			assert.Equal(t, tc.focus, model.layout.focus, "focus must not change")
+			assert.Equal(t, "a.go", model.tree.SelectedFile(), "tree selection must not change")
+
+			// Shift+K scrolls back up by one wheel step.
+			result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'K'}})
+			model = result.(Model)
+			assert.Equal(t, 0, model.layout.viewport.YOffset, "K should scroll diff viewport back up one wheel step")
+			assert.Equal(t, tc.focus, model.layout.focus, "focus must not change")
+			assert.Equal(t, "a.go", model.tree.SelectedFile(), "tree selection must not change")
+		})
+	}
+}
+
+// When the diff fits the viewport the offset can't change, so J is a no-op in
+// either focus mode.
+func TestModel_JKScrollDiffNoOpWhenContentFits(t *testing.T) {
+	lines := []git.DiffLine{
+		{NewNum: 1, Content: "line", ChangeType: git.ChangeContext},
+		{NewNum: 2, Content: "line", ChangeType: git.ChangeContext},
+	}
+
+	focusCases := []struct {
+		name  string
+		focus pane
+	}{
+		{"tree focused", paneTree},
+		{"diff focused", paneDiff},
+	}
+	for _, tc := range focusCases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := testModel([]string{"a.go", "b.go"}, map[string][]git.DiffLine{"a.go": lines})
+			result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+			model := result.(Model)
+			result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+			model = result.(Model)
+			model.tree = testNewFileTree([]string{"a.go", "b.go"})
+			model.layout.focus = tc.focus
+
+			result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'J'}})
+			model = result.(Model)
+			assert.Equal(t, 0, model.layout.viewport.YOffset, "J must be a no-op when the diff fits the viewport")
+			assert.Equal(t, tc.focus, model.layout.focus)
+			assert.Equal(t, "a.go", model.tree.SelectedFile())
+		})
+	}
+}
+
+func TestModel_ScrollDiffPageActionsScrollViewport(t *testing.T) {
+	lines := make([]git.DiffLine, 400)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	cases := []struct {
+		name    string
+		mapping string
+		key     tea.KeyMsg
+		step    func(m Model) int
+	}{
+		{"page down", "map pgdown scroll_diff_page_down", tea.KeyMsg{Type: tea.KeyPgDown}, func(m Model) int { return m.pageRows() }},
+		{"half page down", "map ctrl+d scroll_diff_half_page_down", tea.KeyMsg{Type: tea.KeyCtrlD}, func(m Model) int { return m.halfPageRows() }},
+	}
+	focusCases := []struct {
+		name  string
+		focus pane
+	}{
+		{"tree focused", paneTree},
+		{"diff focused", paneDiff},
+	}
+
+	for _, tc := range cases {
+		for _, fc := range focusCases {
+			t.Run(tc.name+"/"+fc.name, func(t *testing.T) {
+				model := scrollDiffPageModel(t, lines, fc.focus, tc.mapping)
+				step := tc.step(model)
+				require.Positive(t, step)
+
+				result, _ := model.Update(tc.key)
+				model = result.(Model)
+				assert.Equal(t, step, model.layout.viewport.YOffset)
+				assert.Equal(t, step, model.nav.diffCursor)
+				assert.Equal(t, fc.focus, model.layout.focus)
+				assert.Equal(t, "a.go", model.tree.SelectedFile())
+			})
+		}
+	}
+}
+
+func TestModel_ScrollDiffPageActionsScrollBack(t *testing.T) {
+	lines := make([]git.DiffLine, 400)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+
+	cases := []struct {
+		name     string
+		mappings string
+		down     tea.KeyMsg
+		up       tea.KeyMsg
+		step     func(m Model) int
+	}{
+		{
+			"page", "map pgdown scroll_diff_page_down\nmap pgup scroll_diff_page_up",
+			tea.KeyMsg{Type: tea.KeyPgDown}, tea.KeyMsg{Type: tea.KeyPgUp},
+			func(m Model) int { return m.pageRows() },
+		},
+		{
+			"half page", "map ctrl+d scroll_diff_half_page_down\nmap ctrl+u scroll_diff_half_page_up",
+			tea.KeyMsg{Type: tea.KeyCtrlD}, tea.KeyMsg{Type: tea.KeyCtrlU},
+			func(m Model) int { return m.halfPageRows() },
+		},
+	}
+	focusCases := []struct {
+		name  string
+		focus pane
+	}{
+		{"tree focused", paneTree},
+		{"diff focused", paneDiff},
+	}
+	for _, tc := range cases {
+		for _, fc := range focusCases {
+			t.Run(tc.name+"/"+fc.name, func(t *testing.T) {
+				model := scrollDiffPageModel(t, lines, fc.focus, tc.mappings)
+
+				result, _ := model.Update(tc.down)
+				model = result.(Model)
+				require.Equal(t, tc.step(model), model.layout.viewport.YOffset)
+
+				result, _ = model.Update(tc.up)
+				model = result.(Model)
+				assert.Zero(t, model.layout.viewport.YOffset)
+				assert.Equal(t, fc.focus, model.layout.focus)
+				assert.Equal(t, "a.go", model.tree.SelectedFile())
+			})
+		}
+	}
+}
+
+func TestModel_ScrollDiffPageActionsHonorPageOverlap(t *testing.T) {
+	lines := make([]git.DiffLine, 400)
+	for i := range lines {
+		lines[i] = git.DiffLine{NewNum: i + 1, Content: "line", ChangeType: git.ChangeContext}
+	}
+	const overlap = 5
+
+	t.Run("full page subtracts overlap", func(t *testing.T) {
+		model := scrollDiffPageModel(t, lines, paneTree, "map pgdown scroll_diff_page_down")
+		model.modes.pageOverlap = overlap
+		height := model.layout.viewport.Height
+		require.Greater(t, height, overlap)
+
+		result, _ := model.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		model = result.(Model)
+		assert.Equal(t, height-overlap, model.layout.viewport.YOffset)
+	})
+
+	t.Run("half page ignores overlap", func(t *testing.T) {
+		model := scrollDiffPageModel(t, lines, paneTree, "map ctrl+d scroll_diff_half_page_down")
+		model.modes.pageOverlap = overlap
+		height := model.layout.viewport.Height
+
+		result, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+		model = result.(Model)
+		assert.Equal(t, max(1, height/2), model.layout.viewport.YOffset)
+	})
+}
+
+// scrollDiffPageModel loads a two-file model with the given pane focused and the given
+// keybindings file content parsed through keymap.Load.
+func scrollDiffPageModel(t *testing.T, lines []git.DiffLine, focus pane, mappings string) Model {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "keybindings")
+	require.NoError(t, os.WriteFile(path, []byte(mappings+"\n"), 0o600))
+	km, err := keymap.Load(path)
+	require.NoError(t, err)
+
+	m := testModel([]string{"a.go", "b.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	model = result.(Model)
+	model.tree = testNewFileTree([]string{"a.go", "b.go"})
+	model.layout.focus = focus
+	model.keymap = km
+	require.Zero(t, model.layout.viewport.YOffset)
+	require.Equal(t, "a.go", model.tree.SelectedFile())
+	return model
+}
+
+func BenchmarkModel_PageNavigation(b *testing.B) {
+	lines := make([]git.DiffLine, 10_000)
+	for i := range lines {
+		lines[i] = git.DiffLine{
+			NewNum:     i + 1,
+			Content:    "func pageNavigationBenchmark() {}",
+			ChangeType: git.ChangeContext,
+		}
+	}
+
+	m := testModel([]string{"large.go"}, map[string][]git.DiffLine{"large.go": lines})
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 44})
+	model := result.(Model)
+	result, _ = model.Update(fileLoadedMsg{file: "large.go", lines: lines})
+	model = result.(Model)
+	model.layout.focus = paneDiff
+	model.nav.diffCursor = len(lines) / 2
+	model.layout.viewport.SetContent(model.renderDiff())
+	model.layout.viewport.SetYOffset(model.nav.diffCursor)
+
+	down := true
+	for b.Loop() {
+		if down {
+			model.moveDiffCursorPageDown()
+		} else {
+			model.moveDiffCursorPageUp()
+		}
+		down = !down
+	}
+}
+
+func TestModel_DownPageMotionTerminatesOnAnnotatedLastLine(t *testing.T) {
+	// the downward walk must terminate once it reaches a final navigable line carrying an
+	// annotation: moveDiffCursorDownWithHunks alternates onAnnotationRow false->true (annotation
+	// stop) then true->false (no next line found), so comparing only against the previous step never
+	// sees "no movement", and the visual delta oscillates by the diff line's own wrapped height
+	// (cursorViewportYFromOffsets adds wrappedLineCount(diffCursor) when the flag is set), which stays
+	// inside the rows budget in these cases so that check does not trip either.
+	newModel := func(cursor int, onAnnot, trailingDivider bool) Model {
+		lines := make([]git.DiffLine, 0, 21)
+		for i := range 20 {
+			lines = append(lines, git.DiffLine{NewNum: i + 1, Content: "ctx", ChangeType: git.ChangeContext})
+		}
+		if trailingDivider {
+			// compact mode leaves a non-navigable divider after the last real line
+			lines = append(lines, git.DiffLine{Content: "⋯ 12 lines ⋯", ChangeType: git.ChangeDivider})
+		}
+		m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+		result, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+		model := result.(Model)
+		result, _ = model.Update(fileLoadedMsg{file: "a.go", lines: lines})
+		model = result.(Model)
+		model.layout.focus = paneDiff
+		// annotate the last navigable line, which is the last context row whether or not a
+		// non-navigable divider follows it
+		model.store.Add(annot.Annotation{File: "a.go", Line: model.diffLineNum(lines[19]),
+			Type: string(git.ChangeContext), Comment: "note on the last line"})
+		model.invalidateRenderCaches()
+		model.nav.diffCursor, model.nav.onAnnotationRow = cursor, onAnnot
+		return model
+	}
+
+	tests := []struct {
+		name            string
+		cursor          int
+		onAnnot         bool
+		trailingDivider bool
+		motion          func(*Model)
+	}{
+		{"page down parked on last line", 19, false, false, (*Model).moveDiffCursorPageDown},
+		{"page down parked on last annotation", 19, true, false, (*Model).moveDiffCursorPageDown},
+		{"page down walking into last line", 5, false, false, (*Model).moveDiffCursorPageDown},
+		{"half page down parked on last line", 19, false, false, (*Model).moveDiffCursorHalfPageDown},
+		{"half page down walking into last line", 12, false, false, (*Model).moveDiffCursorHalfPageDown},
+		{"page down with trailing divider", 19, false, true, (*Model).moveDiffCursorPageDown},
+		{"page down walking into trailing divider", 5, false, true, (*Model).moveDiffCursorPageDown},
+		{"half page down with trailing divider", 19, true, true, (*Model).moveDiffCursorHalfPageDown},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			model := newModel(tc.cursor, tc.onAnnot, tc.trailingDivider)
+			done := make(chan struct{})
+			go func() { defer close(done); tc.motion(&model) }()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("page motion never returned - the walk is not terminating")
+			}
+			assert.Equal(t, 19, model.nav.diffCursor, "walk must settle on the last navigable line")
+			assert.True(t, model.nav.onAnnotationRow, "cursor must park on the annotation sub-row, not fall back to the diff row")
+		})
+	}
+}
+
+// clampTestModel builds a diff-pane model with a hidden tree and a known content width,
+// with lineWidths populated the way handleFileLoaded populates it.
+func clampTestModel(t *testing.T, lines []git.DiffLine, width int) Model {
+	t.Helper()
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	m.layout.width = width
+	m.layout.height = 24
+	m.layout.treeHidden = true
+	m.layout.focus = paneDiff
+	m.layout.viewport.Width = width - 4
+	m.layout.viewport.Height = 20
+	m.file.name = "a.go"
+	m.file.lines = lines
+	m.file.highlighted = make([]string, len(lines))
+	for i, dl := range lines {
+		m.file.highlighted[i] = dl.Content
+	}
+	m.file.lineWidths = m.computeLineWidths()
+	return m
+}
+
+func TestModel_ComputeLineWidths(t *testing.T) {
+	tests := []struct {
+		name string
+		line git.DiffLine
+		want int
+	}{
+		{"context row carries the three-column prefix", git.DiffLine{ChangeType: git.ChangeContext, Content: "abc"}, 6},
+		{"added row carries the three-column prefix", git.DiffLine{ChangeType: git.ChangeAdd, Content: "abcd"}, 7},
+		{"removed row carries the three-column prefix", git.DiffLine{ChangeType: git.ChangeRemove, Content: "ab"}, 5},
+		{"divider row carries a single leading space", git.DiffLine{ChangeType: git.ChangeDivider, Content: "abc"}, 4},
+		{"wide runes count two columns each", git.DiffLine{ChangeType: git.ChangeContext, Content: "世界"}, 7},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := clampTestModel(t, []git.DiffLine{tt.line}, 200)
+			assert.Equal(t, tt.want, m.file.lineWidths[0])
+		})
+	}
+}
+
+func TestModel_ComputeLineWidthsExpandsTabs(t *testing.T) {
+	m := clampTestModel(t, []git.DiffLine{{ChangeType: git.ChangeContext, Content: "\tx"}}, 200)
+	assert.Equal(t, changePrefixWidth+len(m.cfg.tabSpaces)+1, m.file.lineWidths[0])
+}
+
+func TestModel_HorizontalScrollStopsWithContentVisible(t *testing.T) {
+	wide := strings.Repeat("x", 100) + "ENDTOKEN"
+	m := clampTestModel(t, []git.DiffLine{{ChangeType: git.ChangeContext, Content: wide, NewNum: 1}}, 40)
+
+	for range 200 {
+		m.handleHorizontalScroll(1)
+	}
+
+	assert.Equal(t, m.maxHorizontalScroll(), m.layout.scrollX, "scroll must stop at the bound")
+	stripped := ansi.Strip(m.renderDiff())
+	assert.Contains(t, stripped, "ENDTOKEN", "the widest row's tail must stay visible at the bound")
+	assert.NotContains(t, stripped, "»", "nothing is left off the right edge at the bound")
+}
+
+func TestModel_HorizontalScrollLeftClampsAtZero(t *testing.T) {
+	wide := strings.Repeat("x", 100)
+	m := clampTestModel(t, []git.DiffLine{{ChangeType: git.ChangeContext, Content: wide, NewNum: 1}}, 40)
+
+	for range 50 {
+		m.handleHorizontalScroll(-1)
+	}
+	assert.Equal(t, 0, m.layout.scrollX)
+}
+
+func TestModel_HorizontalScrollBoundIgnoresCollapsedHiddenLine(t *testing.T) {
+	lines := []git.DiffLine{
+		{ChangeType: git.ChangeRemove, Content: strings.Repeat("r", 400), OldNum: 1},
+		{ChangeType: git.ChangeAdd, Content: "short add", NewNum: 1},
+	}
+	m := clampTestModel(t, lines, 40)
+
+	expandedBound := m.maxHorizontalScroll()
+	m.modes.collapsed.enabled = true
+	collapsedBound := m.maxHorizontalScroll()
+
+	assert.Positive(t, expandedBound, "the wide removed line is rendered when not collapsed")
+	assert.Equal(t, 0, collapsedBound, "a hidden removed line must not widen the bound")
+}
+
+func TestModel_HorizontalScrollBoundFollowsHunkExpansion(t *testing.T) {
+	lines := []git.DiffLine{
+		{ChangeType: git.ChangeRemove, Content: strings.Repeat("r", 400), OldNum: 1},
+		{ChangeType: git.ChangeAdd, Content: "short add", NewNum: 1},
+	}
+	m := clampTestModel(t, lines, 40)
+	m.modes.collapsed.enabled = true
+
+	hidden := m.maxHorizontalScroll()
+	m.modes.collapsed.expandedHunks = map[int]bool{0: true}
+	expanded := m.maxHorizontalScroll()
+	m.modes.collapsed.expandedHunks = map[int]bool{}
+	rehidden := m.maxHorizontalScroll()
+
+	assert.Equal(t, 0, hidden)
+	assert.Positive(t, expanded, "expanding the hunk reveals the wide removed line")
+	assert.Equal(t, 0, rehidden, "re-collapsing hides it again")
+}
+
+func TestModel_HorizontalScrollBoundCountsDeletePlaceholder(t *testing.T) {
+	lines := []git.DiffLine{
+		{ChangeType: git.ChangeRemove, Content: "gone", OldNum: 1},
+		{ChangeType: git.ChangeRemove, Content: "gone too", OldNum: 2},
+	}
+	m := clampTestModel(t, lines, 20)
+	m.modes.collapsed.enabled = true
+
+	want := changePrefixWidth + lipgloss.Width(m.deletePlaceholderText(0))
+	assert.Equal(t, want, m.maxRenderedContentWidth())
+}
+
+func TestModel_HorizontalScrollReclampsWhenGutterShrinks(t *testing.T) {
+	wide := strings.Repeat("x", 100)
+	m := clampTestModel(t, []git.DiffLine{{ChangeType: git.ChangeContext, Content: wide, NewNum: 1}}, 40)
+	m.modes.lineNumbers = true
+	m.file.lineNumWidth = m.computeLineNumWidth()
+
+	for range 200 {
+		m.handleHorizontalScroll(1)
+	}
+	withNumbers := m.layout.scrollX
+
+	m.toggleLineNumbers()
+	assert.Less(t, m.layout.scrollX, withNumbers, "offset must follow the bound down")
+	assert.Equal(t, m.maxHorizontalScroll(), m.layout.scrollX)
+}
+
+func TestModel_HorizontalScrollReclampsOnCollapsedToggle(t *testing.T) {
+	lines := []git.DiffLine{
+		{ChangeType: git.ChangeRemove, Content: strings.Repeat("r", 400), OldNum: 1},
+		{ChangeType: git.ChangeAdd, Content: "short add", NewNum: 1},
+	}
+	m := clampTestModel(t, lines, 40)
+
+	for range 200 {
+		m.handleHorizontalScroll(1)
+	}
+	scrolled := m.layout.scrollX
+	require.Positive(t, scrolled)
+
+	m.toggleCollapsedMode()
+
+	assert.Equal(t, 0, m.layout.scrollX, "hiding the widest row must pull the offset back in")
+	assert.Contains(t, ansi.Strip(m.renderDiff()), "short add", "the pane must not blank")
+}
+
+func TestModel_HorizontalScrollReclampsOnHunkRecollapse(t *testing.T) {
+	lines := []git.DiffLine{
+		{ChangeType: git.ChangeRemove, Content: strings.Repeat("r", 400), OldNum: 1},
+		{ChangeType: git.ChangeAdd, Content: "short add", NewNum: 1},
+	}
+	m := clampTestModel(t, lines, 40)
+	m.modes.collapsed.enabled = true
+	m.modes.collapsed.expandedHunks = map[int]bool{0: true}
+	m.nav.diffCursor = 0
+
+	for range 200 {
+		m.handleHorizontalScroll(1)
+	}
+	require.Positive(t, m.layout.scrollX)
+
+	m.toggleHunkExpansion()
+
+	assert.Equal(t, 0, m.layout.scrollX, "re-hiding the expanded row must pull the offset back in")
+	assert.Contains(t, ansi.Strip(m.renderDiff()), "short add", "the pane must not blank")
+}
+
+func TestModel_HorizontalScrollHealsMissingWidthCache(t *testing.T) {
+	wide := strings.Repeat("x", 100)
+	m := clampTestModel(t, []git.DiffLine{{ChangeType: git.ChangeContext, Content: wide, NewNum: 1}}, 40)
+	m.file.lineWidths = nil
+
+	m.handleHorizontalScroll(1)
+
+	assert.Len(t, m.file.lineWidths, 1, "the cache is rebuilt rather than left empty")
+	assert.Equal(t, scrollStep, m.layout.scrollX, "a missing cache must not disable horizontal scroll")
+}

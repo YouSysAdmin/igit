@@ -1,0 +1,43 @@
+version: 2
+
+builds:
+  - id: igit
+    main: ./cmd/igit
+    binary: igit
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.revision={{.Tag}}-{{.ShortCommit}}-{{ trimsuffix (replace (replace .CommitDate "-" "") ":" "") "Z" }}
+
+archives:
+  - id: igit
+    ids:
+      - igit
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - NOTICE
+
+homebrew_casks:
+  - repository:
+      owner: YouSysAdmin
+      name: homebrew-apps
+    directory: Casks
+    homepage: https://github.com/yousysadmin/igit
+    description: Review and GIT tools
+    license: MIT
+    hooks:
+      post:
+        # the release binaries are unsigned, so Gatekeeper quarantines them
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"], print_stderr: false).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/igit"]
+          end
+

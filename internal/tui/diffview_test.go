@@ -1,0 +1,1847 @@
+package tui
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/mattn/go-runewidth"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/yousysadmin/igit/internal/annot"
+	"github.com/yousysadmin/igit/internal/git"
+	"github.com/yousysadmin/igit/internal/tui/mocks"
+	"github.com/yousysadmin/igit/internal/tui/overlay"
+	"github.com/yousysadmin/igit/internal/tui/style"
+	"github.com/yousysadmin/igit/internal/tui/worddiff"
+)
+
+func TestModel_LineNumGutter(t *testing.T) {
+	m := testModel(nil, nil)
+	m.modes.lineNumbers = true
+	m.file.lineNumWidth = 3
+
+	tests := []struct {
+		name string
+		dl   git.DiffLine
+		want string // plain text content (ANSI stripped)
+	}{
+		{
+			name: "context line",
+			dl:   git.DiffLine{OldNum: 25, NewNum: 32, ChangeType: git.ChangeContext},
+			want: "  25  32", // " " + " 25" + " " + " 32"
+		},
+		{
+			name: "add line",
+			dl:   git.DiffLine{OldNum: 0, NewNum: 40, ChangeType: git.ChangeAdd},
+			want: "      40", // " " + "   " + " " + " 40"
+		},
+		{
+			name: "remove line",
+			dl:   git.DiffLine{OldNum: 40, NewNum: 0, ChangeType: git.ChangeRemove},
+			want: "  40    ", // " " + " 40" + " " + "   "
+		},
+		{
+			name: "divider",
+			dl:   git.DiffLine{ChangeType: git.ChangeDivider},
+			want: "        ", // " " + "   " + " " + "   "
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := m.lineNumGutter(tt.dl)
+			stripped := ansi.Strip(got)
+			assert.Equal(t, tt.want, stripped)
+		})
+	}
+}
+
+func TestModel_LineNumGutter_SingleColumn(t *testing.T) {
+	m := testModel(nil, nil)
+	m.modes.lineNumbers = true
+	m.file.lineNumWidth = 3
+	m.file.singleColLineNum = true
+
+	tests := []struct {
+		name string
+		dl   git.DiffLine
+		want string // plain text content (ANSI stripped)
+	}{
+		{
+			name: "context line",
+			dl:   git.DiffLine{OldNum: 25, NewNum: 32, ChangeType: git.ChangeContext},
+			want: "  32", // " " + " 32"
+		},
+		{
+			name: "divider",
+			dl:   git.DiffLine{ChangeType: git.ChangeDivider},
+			want: "    ", // " " + "   "
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := m.lineNumGutter(tt.dl)
+			stripped := ansi.Strip(got)
+			assert.Equal(t, tt.want, stripped)
+		})
+	}
+}
+
+func TestModel_LineNumGutter_TwoColumnUnchanged(t *testing.T) {
+	m := testModel(nil, nil)
+	m.modes.lineNumbers = true
+	m.file.lineNumWidth = 3
+	m.file.singleColLineNum = false
+
+	tests := []struct {
+		name string
+		dl   git.DiffLine
+		want string
+	}{
+		{
+			name: "context line",
+			dl:   git.DiffLine{OldNum: 25, NewNum: 32, ChangeType: git.ChangeContext},
+			want: "  25  32",
+		},
+		{
+			name: "add line",
+			dl:   git.DiffLine{OldNum: 0, NewNum: 40, ChangeType: git.ChangeAdd},
+			want: "      40",
+		},
+		{
+			name: "remove line",
+			dl:   git.DiffLine{OldNum: 40, NewNum: 0, ChangeType: git.ChangeRemove},
+			want: "  40    ",
+		},
+		{
+			name: "divider",
+			dl:   git.DiffLine{ChangeType: git.ChangeDivider},
+			want: "        ",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := m.lineNumGutter(tt.dl)
+			stripped := ansi.Strip(got)
+			assert.Equal(t, tt.want, stripped)
+		})
+	}
+}
+
+func TestModel_LineNumGutter_WidthConsistency(t *testing.T) {
+	// width-consistency: runewidth.StringWidth(stripped gutter) == lineNumGutterWidth()
+	// for representative DiffLine values in both single-column and two-column modes
+	tests := []struct {
+		name      string
+		singleCol bool
+		dl        git.DiffLine
+	}{
+		{"single-col context", true, git.DiffLine{OldNum: 10, NewNum: 10, ChangeType: git.ChangeContext}},
+		{"single-col divider", true, git.DiffLine{ChangeType: git.ChangeDivider}},
+		{"two-col context", false, git.DiffLine{OldNum: 10, NewNum: 20, ChangeType: git.ChangeContext}},
+		{"two-col add", false, git.DiffLine{OldNum: 0, NewNum: 5, ChangeType: git.ChangeAdd}},
+		{"two-col remove", false, git.DiffLine{OldNum: 5, NewNum: 0, ChangeType: git.ChangeRemove}},
+		{"two-col divider", false, git.DiffLine{ChangeType: git.ChangeDivider}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := testModel(nil, nil)
+			m.file.lineNumWidth = 3
+			m.file.singleColLineNum = tt.singleCol
+			got := m.lineNumGutter(tt.dl)
+			stripped := ansi.Strip(got)
+			assert.Equal(t, m.lineNumGutterWidth(), runewidth.StringWidth(stripped),
+				"gutter width mismatch: got %q (width %d), want %d",
+				stripped, runewidth.StringWidth(stripped), m.lineNumGutterWidth())
+		})
+	}
+}
+
+func TestModel_RenderDiffLineWithLineNumbers(t *testing.T) {
+	m := testModel(nil, nil)
+	m.modes.lineNumbers = true
+	m.file.lineNumWidth = 2
+	m.layout.focus = paneDiff
+	m.file.lines = []git.DiffLine{
+		{OldNum: 5, NewNum: 5, Content: "hello", ChangeType: git.ChangeContext},
+		{OldNum: 6, NewNum: 0, Content: "removed", ChangeType: git.ChangeRemove},
+		{OldNum: 0, NewNum: 6, Content: "added", ChangeType: git.ChangeAdd},
+	}
+	m.file.highlighted = nil
+
+	rendered := m.renderDiff()
+	stripped := ansi.Strip(rendered)
+
+	assert.Contains(t, stripped, " 5  5")
+	assert.Contains(t, stripped, " 6    ")
+	assert.Contains(t, stripped, "    6")
+}
+
+func TestModel_RenderDiffLineWithoutLineNumbers(t *testing.T) {
+	m := testModel(nil, nil)
+	m.modes.lineNumbers = false
+	m.file.lines = []git.DiffLine{
+		{OldNum: 5, NewNum: 5, Content: "hello", ChangeType: git.ChangeContext},
+	}
+
+	rendered := m.renderDiff()
+	stripped := ansi.Strip(rendered)
+
+	// should NOT contain number gutter, just the prefix
+	assert.NotContains(t, stripped, " 5  5")
+	assert.Contains(t, stripped, "hello")
+}
+
+func TestModel_RenderWrappedDiffLineWithLineNumbers(t *testing.T) {
+	m := testModel(nil, nil)
+	m.modes.lineNumbers = true
+	m.file.lineNumWidth = 2
+	m.modes.wrap = true
+	m.layout.focus = paneDiff
+	m.layout.width = 50
+	m.layout.treeWidth = 0
+	m.file.singleFile = true
+	m.file.lines = []git.DiffLine{
+		{OldNum: 5, NewNum: 5, Content: "short", ChangeType: git.ChangeContext},
+	}
+
+	rendered := m.renderDiff()
+	stripped := ansi.Strip(rendered)
+
+	// first line should have numbers
+	assert.Contains(t, stripped, " 5  5")
+}
+
+func TestModel_LineNumGutterWidth(t *testing.T) {
+	m := testModel(nil, nil)
+	m.file.lineNumWidth = 3
+	// width = 1 (leading space) + 3 (old) + 1 (space) + 3 (new) = 8
+	assert.Equal(t, 8, m.lineNumGutterWidth())
+
+	m.file.lineNumWidth = 1
+	// width = 1 + 1 + 1 + 1 = 4
+	assert.Equal(t, 4, m.lineNumGutterWidth())
+}
+
+func TestModel_LineNumGutterWidth_SingleColumn(t *testing.T) {
+	m := testModel(nil, nil)
+	m.file.singleColLineNum = true
+
+	m.file.lineNumWidth = 3
+	// single-column: " " + num(3) = 4
+	assert.Equal(t, 4, m.lineNumGutterWidth())
+
+	m.file.lineNumWidth = 1
+	// single-column: " " + num(1) = 2
+	assert.Equal(t, 2, m.lineNumGutterWidth())
+}
+
+func TestModel_LineNumGutterWidth_TwoColumnWhenNotSingleCol(t *testing.T) {
+	m := testModel(nil, nil)
+	m.file.singleColLineNum = false
+
+	m.file.lineNumWidth = 3
+	// two-column: " " + old(3) + " " + new(3) = 8
+	assert.Equal(t, 8, m.lineNumGutterWidth())
+
+	m.file.lineNumWidth = 2
+	// two-column: " " + old(2) + " " + new(2) = 6
+	assert.Equal(t, 6, m.lineNumGutterWidth())
+}
+
+func TestModel_RenderDiffEmpty(t *testing.T) {
+	m := testModel(nil, nil)
+	m.file.lines = nil
+	assert.Contains(t, m.renderDiff(), "no changes")
+}
+
+func TestModel_RenderDiffLines(t *testing.T) {
+	m := testModel(nil, nil)
+	m.file.lines = []git.DiffLine{
+		{NewNum: 1, Content: "package main", ChangeType: git.ChangeContext},
+		{NewNum: 2, Content: "func foo() {}", ChangeType: git.ChangeAdd},
+		{OldNum: 3, Content: "func bar() {}", ChangeType: git.ChangeRemove},
+		{Content: "~~~", ChangeType: git.ChangeDivider},
+	}
+
+	rendered := m.renderDiff()
+	assert.Contains(t, rendered, "package main")
+	assert.Contains(t, rendered, "func foo()")
+	assert.Contains(t, rendered, "func bar()")
+}
+
+func TestModel_ExtendLineBg(t *testing.T) {
+	bg := style.Color("\033[48;2;46;52;64m") // pre-resolved ANSI bg sequence
+
+	t.Run("empty bgColor is no-op", func(t *testing.T) {
+		m := testModel(nil, nil)
+		m.layout.width = 80
+		assert.Equal(t, "hello", m.extendLineBg("hello", ""))
+	})
+
+	t.Run("pads to content width", func(t *testing.T) {
+		m := testModel(nil, nil)
+		m.layout.width = 80
+		result := m.extendLineBg("hi", bg)
+		assert.Contains(t, result, "\033[48;2;46;52;64m")
+		assert.Contains(t, result, "\033[49m")
+		w := lipgloss.Width(result)
+		assert.Greater(t, w, 2, "should be wider than input")
+	})
+
+	t.Run("with line numbers subtracts gutter", func(t *testing.T) {
+		m := testModel(nil, nil)
+		m.layout.width = 80
+		m.modes.lineNumbers = true
+		m.file.lineNumWidth = 3
+		resultWithNums := m.extendLineBg("hi", bg)
+		m.modes.lineNumbers = false
+		resultWithout := m.extendLineBg("hi", bg)
+		assert.Less(t, lipgloss.Width(resultWithNums), lipgloss.Width(resultWithout), "line numbers should reduce target width")
+	})
+}
+
+func TestModel_RenderDiffLineHighlighted(t *testing.T) {
+	lines := []git.DiffLine{
+		{OldNum: 1, NewNum: 1, Content: "package main", ChangeType: git.ChangeContext},
+		{NewNum: 2, Content: "func foo() {}", ChangeType: git.ChangeAdd},
+		{OldNum: 2, Content: "func bar() {}", ChangeType: git.ChangeRemove},
+	}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.file.highlighted = []string{"hl-context", "hl-add", "hl-remove"}
+	// the load above already rendered and cached with no highlighting. file.highlighted is one
+	// of the render inputs that cannot live in globalRenderKey, so assigning it owes an
+	// invalidation exactly as handleFileLoaded and refreshDiff do
+	m.invalidateRenderCaches()
+	m.layout.focus = paneDiff
+	output := m.renderDiff()
+
+	assert.Contains(t, output, "hl-context", "highlighted context line should appear")
+	assert.Contains(t, output, "hl-add", "highlighted add line should appear")
+	assert.Contains(t, output, "hl-remove", "highlighted remove line should appear")
+}
+
+func TestModel_RenderDiffLineCursorHighlight(t *testing.T) {
+	lines := []git.DiffLine{
+		{OldNum: 1, NewNum: 1, Content: "line one", ChangeType: git.ChangeContext},
+		{OldNum: 2, NewNum: 2, Content: "line two", ChangeType: git.ChangeContext},
+	}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.layout.focus = paneDiff
+	m.nav.diffCursor = 0
+	output := m.renderDiff()
+	assert.Contains(t, output, "▶", "cursor indicator should appear on active line")
+	assert.Contains(t, output, "line one", "cursor line content should appear")
+}
+
+func TestModel_RenderDiffLineTabReplacement(t *testing.T) {
+	lines := []git.DiffLine{
+		{OldNum: 1, NewNum: 1, Content: "\tfoo", ChangeType: git.ChangeContext},
+	}
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+	m.cfg.tabSpaces = "    " // 4 spaces
+	output := m.renderDiff()
+	assert.Contains(t, output, "    foo", "tabs should be replaced with spaces")
+	assert.NotContains(t, output, "\t", "no raw tabs should remain")
+}
+
+func TestModel_ApplyHorizontalScrollTruncatesLongLines(t *testing.T) {
+	m := testModel(nil, nil)
+	m.layout.width = 80
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 0
+
+	// content wider than diffContentWidth should be truncated
+	longContent := strings.Repeat("x", 200)
+	result := m.applyHorizontalScroll(longContent, "")
+	// when right overflow is present, output extends 1 col beyond cutWidth into the pane's right
+	// padding column so the indicator sits flush against the border
+	maxWidth := m.diffContentWidth() - m.gutterExtra() + 1
+	resultWidth := lipgloss.Width(result)
+	assert.LessOrEqual(t, resultWidth, maxWidth, "long line should be truncated to content width (+1 for flush indicator)")
+}
+
+func TestModel_ExtendLineBgAfterScrollFillsWidth(t *testing.T) {
+	bg := style.Color("\033[48;2;46;52;64m")
+	res := style.PlainResolver()
+	m := testModel(nil, nil)
+	m.layout.width = 80
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 10
+	m.resolver = res
+	m.renderer = style.NewRenderer(res)
+	m.sgr = style.SGR{}
+
+	// simulate a styled add line longer than content width
+	longContent := strings.Repeat("x", 200)
+	scrolled := m.applyHorizontalScroll(longContent, bg)
+	extended := m.extendLineBg(scrolled, bg)
+
+	// scrollX > 0 and overflow on both sides: right indicator extends by 1 col into pane padding
+	expectedWidth := m.diffContentWidth() - m.gutterExtra() + 1
+	resultWidth := lipgloss.Width(extended)
+	assert.Equal(t, expectedWidth, resultWidth, "scroll output should fill content width plus the flush right indicator col")
+}
+
+func TestModel_ExtendLineBgWithoutOverflowFillsWidth(t *testing.T) {
+	bg := style.Color("\033[48;2;46;52;64m")
+	res := style.PlainResolver()
+	m := testModel(nil, nil)
+	m.layout.width = 80
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 0
+	m.resolver = res
+	m.renderer = style.NewRenderer(res)
+	m.sgr = style.SGR{}
+
+	// short content with no overflow gets padded by extendLineBg to full cut width (no indicator extension)
+	shortContent := "hello"
+	scrolled := m.applyHorizontalScroll(shortContent, bg)
+	extended := m.extendLineBg(scrolled, bg)
+
+	expectedWidth := m.diffContentWidth() - m.gutterExtra()
+	resultWidth := lipgloss.Width(extended)
+	assert.Equal(t, expectedWidth, resultWidth, "without overflow, bg should fill exactly to cut width")
+}
+
+func TestModel_ApplyHorizontalScrollShowsRightIndicator(t *testing.T) {
+	m := testModel(nil, nil)
+	m.layout.width = 80
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 0
+
+	// content wider than viewport should get a right-pointing indicator with a leading space
+	longContent := strings.Repeat("x", 200)
+	result := m.applyHorizontalScroll(longContent, style.Color("\033[48;2;46;52;64m"))
+	plain := ansi.Strip(result)
+	assert.Contains(t, plain, "»", "right indicator should appear when content overflows right")
+	assert.NotContains(t, plain, "«", "left indicator should not appear when scrollX is 0")
+	assert.True(t, strings.HasSuffix(plain, " »"), "right indicator should have a leading space separator from content")
+
+	// result extends exactly 1 col beyond cut width to place the arrow flush against the right border
+	expectedWidth := m.diffContentWidth() - m.gutterExtra() + 1
+	resultWidth := lipgloss.Width(result)
+	assert.Equal(t, expectedWidth, resultWidth, "result width should equal cutWidth+1 when right overflow is present")
+}
+
+func TestModel_ApplyHorizontalScrollShowsBothIndicators(t *testing.T) {
+	m := testModel(nil, nil)
+	m.layout.width = 80
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 50
+
+	// scrolling right with content longer than scrollX+cutWidth triggers both overflows
+	longContent := strings.Repeat("x", 200)
+	result := m.applyHorizontalScroll(longContent, style.Color("\033[48;2;46;52;64m"))
+	plain := ansi.Strip(result)
+	assert.Contains(t, plain, "«", "left indicator should appear when scrolled right with hidden content on the left")
+	assert.Contains(t, plain, "»", "right indicator should still appear when content also overflows right")
+}
+
+func TestModel_ApplyHorizontalScrollLeftOnlyOverflow(t *testing.T) {
+	m := testModel(nil, nil)
+	m.layout.width = 80
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 50
+
+	// content of exactly scrollX+cutWidth (126 chars) at scrollX=50: end=126, origWidth=126
+	// hasLeftOverflow: 126 > 50 = true. hasRightOverflow: 126 > 126 = false
+	// left-only path: total visible width should equal cutWidth (no +1 extension)
+	cutWidth := m.diffContentWidth() - m.gutterExtra()
+	content := strings.Repeat("x", m.layout.scrollX+cutWidth)
+	result := m.applyHorizontalScroll(content, style.Color("\033[48;2;46;52;64m"))
+	plain := ansi.Strip(result)
+	assert.Contains(t, plain, "«", "left indicator should appear when scrolled past hidden content on the left")
+	assert.NotContains(t, plain, "»", "right indicator should not appear when content fits within viewport end")
+	assert.True(t, strings.HasPrefix(plain, "«"), "left indicator should be the first visible char")
+
+	// total width should equal cutWidth exactly (no +1 extension since no right overflow)
+	assert.Equal(t, cutWidth, lipgloss.Width(result), "left-only overflow should not trigger the +1 right padding extension")
+}
+
+func TestModel_ApplyHorizontalScrollWithLineNumberGutter(t *testing.T) {
+	m := testModel(nil, nil)
+	m.layout.width = 80
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 0
+	m.modes.lineNumbers = true
+	m.file.lineNumWidth = 3 // gutter width = 2*3 + 2 = 8
+
+	// with gutters enabled, cutWidth = diffContentWidth - gutterExtra = 76 - 8 = 68
+	// right-overflow extends by 1 col into pane padding: total = cutWidth + 1 = 69
+	longContent := strings.Repeat("x", 200)
+	result := m.applyHorizontalScroll(longContent, style.Color("\033[48;2;46;52;64m"))
+	plain := ansi.Strip(result)
+	assert.Contains(t, plain, "»", "right indicator should appear with gutters enabled")
+
+	expectedWidth := m.diffContentWidth() - m.gutterExtra() + 1
+	assert.Equal(t, expectedWidth, lipgloss.Width(result), "gutter-adjusted cut width + 1 for flush right indicator")
+	assert.Equal(t, 8, m.gutterExtra(), "sanity check: gutterExtra computed from lineNumWidth")
+}
+
+func TestModel_ApplyHorizontalScrollNarrowViewportFallback(t *testing.T) {
+	m := testModel(nil, nil)
+	m.layout.width = 14
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 10
+	m.modes.lineNumbers = true
+	m.file.lineNumWidth = 3 // gutter width = 8, cutWidth = max(10, 14-4) - 8 = 2
+
+	// cutWidth=2 with both overflows: innerStart = start+1 = 11, innerEnd = end-1 = 11
+	// innerEnd <= innerStart -> fallback to plain cut (no indicators)
+	require.Equal(t, 2, m.diffContentWidth()-m.gutterExtra(), "test precondition: cutWidth=2")
+	longContent := strings.Repeat("x", 200)
+	assert.NotPanics(t, func() {
+		result := m.applyHorizontalScroll(longContent, style.Color("\033[48;2;46;52;64m"))
+		plain := ansi.Strip(result)
+		// fallback path returns plain cut. no indicators present
+		assert.NotContains(t, plain, "«", "narrow viewport fallback should drop indicators")
+		assert.NotContains(t, plain, "»", "narrow viewport fallback should drop indicators")
+	})
+}
+
+func TestModel_ApplyHorizontalScrollNoIndicatorForShortLines(t *testing.T) {
+	m := testModel(nil, nil)
+	m.layout.width = 80
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 0
+
+	// short content that fits entirely within the viewport should have no indicators
+	result := m.applyHorizontalScroll("short", style.Color("\033[48;2;46;52;64m"))
+	plain := ansi.Strip(result)
+	assert.NotContains(t, plain, "»", "no right indicator for short lines")
+	assert.NotContains(t, plain, "«", "no left indicator for short lines")
+}
+
+func TestModel_ApplyHorizontalScrollNoLeftIndicatorWhenScrolledPastContent(t *testing.T) {
+	m := testModel(nil, nil)
+	m.layout.width = 80
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 100
+
+	// content shorter than scrollX should not show a left indicator (nothing to the left is visible)
+	result := m.applyHorizontalScroll("short", style.Color("\033[48;2;46;52;64m"))
+	plain := ansi.Strip(result)
+	assert.NotContains(t, plain, "«", "left indicator should not appear when content ends before viewport start")
+	assert.NotContains(t, plain, "»", "right indicator should not appear when content ends before viewport")
+}
+
+func TestModel_ApplyHorizontalScrollRightGlyphAlwaysOnDiffBg(t *testing.T) {
+	colors := style.Colors{DiffBg: "#112233", Muted: "#999999"}
+	res := style.NewResolver(colors)
+	m := testModel(nil, nil)
+	m.layout.width = 80
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 0
+	m.resolver = res
+	m.renderer = style.NewRenderer(res)
+	m.sgr = style.SGR{}
+
+	// right indicator: leading space carries the line bg so the colored content area extends
+	// naturally, but the right overflow glyph is always drawn on DiffBg so it reads as pane chrome.
+	// passing a non-empty line bg should produce both the line bg (for the separator space) and
+	// a DiffBg ANSI sequence (for the glyph) in the output, and these must differ.
+	lineBg := style.Color("\033[48;2;170;187;204m") // pre-resolved ANSI for #aabbcc
+	longContent := strings.Repeat("x", 200)
+	result := m.applyHorizontalScroll(longContent, lineBg)
+	assert.Contains(t, ansi.Strip(result), "»", "right indicator glyph should be present")
+	assert.Contains(t, result, string(lineBg), "leading space should carry the passed line bg")
+	assert.Contains(t, result, "\033[48;2;17;34;51m", "right glyph should be drawn on DiffBg regardless of line bg")
+
+	// exactly two \033[49m bg resets: one after the space, one after the glyph
+	assert.Equal(t, 2, strings.Count(result, "\033[49m"), "one bg reset after the space and one after the glyph")
+}
+
+func TestModel_ApplyHorizontalScrollEmptyLineBgSkipsSpaceBg(t *testing.T) {
+	colors := style.Colors{DiffBg: "#112233", Muted: "#999999"}
+	res := style.NewResolver(colors)
+	m := testModel(nil, nil)
+	m.layout.width = 80
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 0
+	m.resolver = res
+	m.renderer = style.NewRenderer(res)
+	m.sgr = style.SGR{}
+
+	// empty line bg (defensive test. production callers never pass ""): the leading space must
+	// not emit a bg setter so the caller's inherited bg is preserved for that cell. the glyph
+	// itself still uses DiffBg, so exactly one bg reset is expected (after the glyph only).
+	longContent := strings.Repeat("x", 200)
+	result := m.applyHorizontalScroll(longContent, "")
+	assert.Contains(t, ansi.Strip(result), "»", "indicator glyph should still render with empty line bg")
+	assert.Contains(t, result, "\033[48;2;17;34;51m", "glyph should still be drawn on DiffBg")
+	assert.Equal(t, 1, strings.Count(result, "\033[49m"), "empty line bg should skip the space-bg reset but keep the glyph-bg reset")
+}
+
+func TestModel_ApplyHorizontalScrollIndicatorInNoColorsMode(t *testing.T) {
+	m := testModel(nil, nil)
+	m.layout.width = 80
+	m.file.singleFile = true
+	m.layout.treeWidth = 0
+	m.layout.scrollX = 0
+	m.cfg.noColors = true
+
+	longContent := strings.Repeat("x", 200)
+	result := m.applyHorizontalScroll(longContent, style.Color("\033[48;2;46;52;64m"))
+	assert.Contains(t, result, "\033[7m", "no-colors mode should use reverse video for indicator")
+	assert.Contains(t, ansi.Strip(result), "»", "indicator glyph should still be visible in no-colors mode")
+}
+
+func TestModel_StyledWrapMarker(t *testing.T) {
+	colors := style.Colors{DiffBg: "#112233", AddBg: "#1a3320", RemoveBg: "#331a1a", Muted: "#999999"}
+	res := style.NewResolver(colors)
+	m := testModel(nil, nil)
+	m.resolver = res
+
+	mutedFg := "\033[38;2;153;153;153m" // #999999
+	diffBg := "\033[48;2;17;34;51m"     // #112233
+	addBg := "\033[48;2;26;51;32m"      // #1a3320
+	removeBg := "\033[48;2;51;26;26m"   // #331a1a
+
+	tests := []struct {
+		name    string
+		bg      style.Color
+		wantBg  string
+		wantStr string // visible glyph
+	}{
+		{name: "context (empty bg falls back to diff bg)", bg: "", wantBg: diffBg, wantStr: " ↪ "},
+		{name: "add line bg", bg: style.Color(addBg), wantBg: addBg, wantStr: " ↪ "},
+		{name: "remove line bg", bg: style.Color(removeBg), wantBg: removeBg, wantStr: " ↪ "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := m.styledWrapMarker(tt.bg, false)
+			assert.Equal(t, tt.wantStr, ansi.Strip(got), "visible content must be exactly ' ↪ '")
+			assert.Contains(t, got, mutedFg, "marker must use muted fg, matching « » indicators")
+			assert.Contains(t, got, tt.wantBg, "marker must carry the resolved line bg")
+			assert.Contains(t, got, "\033[39m", "marker must reset fg so following content keeps its own color")
+			assert.Contains(t, got, "\033[49m", "marker must reset bg so following content keeps its own bg")
+		})
+	}
+
+	t.Run("no-colors mode degrades to plain marker", func(t *testing.T) {
+		plain := testModel(nil, nil)
+		plain.resolver = style.PlainResolver()
+		plain.cfg.noColors = true
+		got := plain.styledWrapMarker("", false)
+		assert.Equal(t, " ↪ ", got, "without colors the marker should carry no ANSI sequences")
+	})
+
+	t.Run("no-colors search-match emits reverse video", func(t *testing.T) {
+		plain := testModel(nil, nil)
+		plain.resolver = style.PlainResolver()
+		plain.cfg.noColors = true
+		got := plain.styledWrapMarker("", true)
+		assert.Contains(t, got, "\033[7m", "search-matched marker must wrap in reverse video so it matches the SearchMatch lipgloss style in plain mode")
+		assert.Contains(t, got, "\033[27m", "search-matched marker must close the reverse video")
+		assert.Equal(t, " ↪ ", ansi.Strip(got), "visible glyph stays the same")
+	})
+
+	t.Run("colored search-match path is identical to non-search (caller already flipped bg)", func(t *testing.T) {
+		mc := testModel(nil, nil)
+		mc.resolver = res
+		searchBg := style.Color("\033[48;2;102;85;34m")
+		gotSearch := mc.styledWrapMarker(searchBg, true)
+		gotNoSearch := mc.styledWrapMarker(searchBg, false)
+		assert.Equal(t, gotNoSearch, gotSearch, "colored path must not branch on searchMatch — caller controls bg")
+	})
+
+	t.Run("wrap indent appends bg-padded spaces", func(t *testing.T) {
+		indent := testModel(nil, nil)
+		indent.resolver = res
+		indent.cfg.wrapIndent = 4
+		got := indent.styledWrapMarker(style.Color(addBg), false)
+		assert.Equal(t, " ↪     ", ansi.Strip(got), "marker plus 4 indent spaces visible")
+		assert.Contains(t, got, addBg, "indent padding stays on line bg")
+		assert.Equal(t, 1, strings.Count(got, "\033[49m"), "single bg reset at end of marker+indent")
+	})
+
+	t.Run("no-colors search-match honors wrap indent", func(t *testing.T) {
+		plain := testModel(nil, nil)
+		plain.resolver = style.PlainResolver()
+		plain.cfg.noColors = true
+		plain.cfg.wrapIndent = 3
+		got := plain.styledWrapMarker("", true)
+		assert.Equal(t, " ↪    ", ansi.Strip(got), "reverse-video marker must include the configured indent")
+	})
+
+	t.Run("oversized indent on narrow pane clamps to zero", func(t *testing.T) {
+		narrow := testModel(nil, nil)
+		narrow.resolver = res
+		narrow.layout.width = 30
+		narrow.layout.treeWidth = 0
+		narrow.file.singleFile = true
+		narrow.cfg.wrapIndent = 200 // far larger than the available content width
+		got := narrow.styledWrapMarker(style.Color(addBg), false)
+		assert.Equal(t, " ↪ ", ansi.Strip(got), "clamp must drop the indent padding when pane is too narrow")
+		assert.Equal(t, 0, narrow.effectiveWrapIndent(), "effectiveWrapIndent should report 0 when clamped")
+	})
+}
+
+func TestModel_WrapWidthClampsLargeIndent(t *testing.T) {
+	m := testModel(nil, nil)
+	m.layout.width = 120
+	m.layout.treeWidth = 0
+	m.file.singleFile = true
+
+	base := m.diffContentWidth() - wrapGutterWidth - m.gutterExtra()
+
+	tests := []struct {
+		name      string
+		indent    int
+		wantWidth int
+		wantEff   int
+	}{
+		{name: "indent 0 returns full base", indent: 0, wantWidth: base, wantEff: 0},
+		{name: "indent 4 reserves room", indent: 4, wantWidth: base - 4, wantEff: 4},
+		{name: "indent at boundary keeps wrapMinContent", indent: base - wrapMinContent, wantWidth: wrapMinContent, wantEff: base - wrapMinContent},
+		{name: "indent past boundary clamps to base", indent: base - wrapMinContent + 1, wantWidth: base, wantEff: 0},
+		{name: "indent equal to base clamps to base", indent: base, wantWidth: base, wantEff: 0},
+		{name: "indent way past base clamps to base", indent: base * 10, wantWidth: base, wantEff: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m.cfg.wrapIndent = tt.indent
+			assert.Equal(t, tt.wantWidth, m.wrapWidth(), "wrapWidth must guard against narrow panes")
+			assert.Equal(t, tt.wantEff, m.effectiveWrapIndent(), "effectiveWrapIndent stays in sync with wrapWidth's clamp")
+		})
+	}
+}
+
+func TestModel_NewModelClampsNegativeWrapIndent(t *testing.T) {
+	renderer := &mocks.DiffSourceMock{
+		ChangedFilesFunc: func(string, bool) ([]git.FileEntry, error) { return nil, nil },
+		FileDiffFunc:     func(git.FileDiffRequest) ([]git.DiffLine, error) { return nil, nil },
+	}
+	m := testNewModel(t, renderer, annot.NewStore(), noopHighlighter(), ModelConfig{WrapIndent: -7})
+	assert.Equal(t, 0, m.cfg.wrapIndent, "negative WrapIndent must clamp to 0 at construction")
+}
+
+func TestModel_WrappedLineCountReactsToIndent(t *testing.T) {
+	m := testModel(nil, nil)
+	m.layout.width = 60
+	m.layout.treeWidth = 0
+	m.file.singleFile = true
+	m.modes.wrap = true
+
+	// content sized so it fits in one row at indent=0 but spills to a second row at indent>=8
+	contentLen := m.diffContentWidth() - wrapGutterWidth - 1
+	textContent := strings.Repeat("x", contentLen)
+	m.file.lines = []git.DiffLine{{ChangeType: git.ChangeContext, Content: textContent}}
+	m.file.highlighted = []string{textContent}
+	m.file.intraRanges = make([][]worddiff.Range, 1)
+
+	m.cfg.wrapIndent = 0
+	noIndentRows := m.wrappedLineCount(0)
+
+	m.cfg.wrapIndent = 8
+	withIndentRows := m.wrappedLineCount(0)
+
+	assert.Greater(t, withIndentRows, noIndentRows, "non-zero wrapIndent must produce more visual rows when content crosses the new wrap boundary")
+}
+
+func TestModel_PlainStyles(t *testing.T) {
+	renderer := &mocks.DiffSourceMock{
+		ChangedFilesFunc: func(string, bool) ([]git.FileEntry, error) { return []git.FileEntry{{Path: "a.go"}}, nil },
+		FileDiffFunc:     func(git.FileDiffRequest) ([]git.DiffLine, error) { return nil, nil },
+	}
+	m := testNewModel(t, renderer, annot.NewStore(), noopHighlighter(), ModelConfig{NoColors: true, TreeWidthRatio: 3})
+	m.layout.width = 120
+	m.layout.height = 40
+	m.layout.treeWidth = 36
+	m.ready = true
+	m.filesLoaded = true
+	// plain styles should not panic and should render
+	output := m.View()
+	assert.NotEmpty(t, output)
+}
+
+func TestModel_TabWidthDefault(t *testing.T) {
+	renderer := &mocks.DiffSourceMock{
+		ChangedFilesFunc: func(string, bool) ([]git.FileEntry, error) { return nil, nil },
+		FileDiffFunc:     func(git.FileDiffRequest) ([]git.DiffLine, error) { return nil, nil },
+	}
+	m := testNewModel(t, renderer, annot.NewStore(), noopHighlighter(), ModelConfig{TabWidth: 0})
+	assert.Equal(t, "    ", m.cfg.tabSpaces, "tab width 0 should default to 4 spaces")
+
+	m2 := testNewModel(t, renderer, annot.NewStore(), noopHighlighter(), ModelConfig{TabWidth: 2})
+	assert.Equal(t, "  ", m2.cfg.tabSpaces, "tab width 2 should produce 2 spaces")
+}
+
+func TestModel_StyleDiffContent(t *testing.T) {
+	res := style.PlainResolver()
+	m := testModel(nil, nil)
+	m.resolver = res
+	m.renderer = style.NewRenderer(res)
+	m.sgr = style.SGR{}
+
+	t.Run("add line", func(t *testing.T) {
+		result := m.styleDiffContent(git.ChangeAdd, " + ", "content", false, false)
+		assert.Contains(t, result, " + content")
+	})
+
+	t.Run("remove line", func(t *testing.T) {
+		result := m.styleDiffContent(git.ChangeRemove, " - ", "content", false, false)
+		assert.Contains(t, result, " - content")
+	})
+
+	t.Run("context line", func(t *testing.T) {
+		result := m.styleDiffContent(git.ChangeContext, "   ", "content", false, false)
+		assert.Contains(t, result, "   content")
+	})
+
+	t.Run("highlighted add", func(t *testing.T) {
+		result := m.styleDiffContent(git.ChangeAdd, " + ", "\033[32mgreen\033[0m", true, false)
+		assert.Contains(t, result, " + ")
+		assert.Contains(t, result, "\033[32m")
+	})
+}
+
+func TestModel_WrapContent_ANSIStatePreservation(t *testing.T) {
+	m := testModel(nil, nil)
+
+	t.Run("fg color carries across wrap boundary", func(t *testing.T) {
+		// simulate chroma-highlighted long token: fg set, long text, fg reset
+		content := "\033[38;2;100;200;50mthis is a very long green token that must wrap\033[39m"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1, "should wrap into multiple lines")
+		// continuation lines must start with the active fg sequence
+		for i := 1; i < len(lines); i++ {
+			assert.Contains(t, lines[i], "\033[38;2;100;200;50m",
+				"continuation line %d should have fg color re-emitted", i)
+		}
+	})
+
+	t.Run("bold carries across wrap boundary", func(t *testing.T) {
+		content := "\033[1mthis is a bold token that should wrap at boundary\033[22m"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1)
+		for i := 1; i < len(lines); i++ {
+			assert.Contains(t, lines[i], "\033[1m", "continuation line %d should have bold re-emitted", i)
+		}
+	})
+
+	t.Run("italic carries across wrap boundary", func(t *testing.T) {
+		content := "\033[3mthis is italic text that should wrap properly\033[23m"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1)
+		for i := 1; i < len(lines); i++ {
+			assert.Contains(t, lines[i], "\033[3m", "continuation line %d should have italic re-emitted", i)
+		}
+	})
+
+	t.Run("fg reset before wrap means no carry", func(t *testing.T) {
+		// fg is set and reset on the first segment, second segment should have no fg
+		content := "\033[32mshort\033[39m and then some more plain text that wraps here"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1)
+		// first line has the color, continuation should NOT re-emit it (already reset)
+		assert.NotContains(t, lines[len(lines)-1], "\033[32m", "reset fg should not carry")
+	})
+
+	t.Run("multiple fg changes across wrap", func(t *testing.T) {
+		// first token green, then red token that wraps
+		content := "\033[32mhi\033[39m \033[31mthis red token is long enough to wrap over\033[39m"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1)
+		// the last line should carry the red fg, not green
+		assert.Contains(t, lines[len(lines)-1], "\033[31m", "should carry the last active fg color")
+		assert.NotContains(t, lines[len(lines)-1], "\033[32m", "should not carry the first fg color")
+	})
+
+	t.Run("full reset clears all state before wrap", func(t *testing.T) {
+		content := "\033[38;2;100;200;50m\033[1m\033[3mstyled text\033[0m and then plain text long enough to wrap here"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1)
+		// after \033[0m, no state should carry to continuation lines
+		last := lines[len(lines)-1]
+		assert.NotContains(t, last, "\033[38;2;100;200;50m", "fg should not carry after full reset")
+		assert.NotContains(t, last, "\033[1m", "bold should not carry after full reset")
+		assert.NotContains(t, last, "\033[3m", "italic should not carry after full reset")
+	})
+
+	t.Run("bare reset ESC[m clears all state", func(t *testing.T) {
+		content := "\033[38;2;100;200;50m\033[1mstyled text\033[m and then plain wrapping text here"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1)
+		last := lines[len(lines)-1]
+		assert.NotContains(t, last, "\033[38;2;100;200;50m", "fg should not carry after bare reset")
+		assert.NotContains(t, last, "\033[1m", "bold should not carry after bare reset")
+	})
+
+	t.Run("no ANSI content unchanged", func(t *testing.T) {
+		content := "plain text that is long enough to wrap at the boundary"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1)
+		// no ANSI codes should appear
+		for _, line := range lines {
+			assert.NotContains(t, line, "\033[", "plain text should have no ANSI injected")
+		}
+	})
+
+	t.Run("bg color carries across wrap boundary", func(t *testing.T) {
+		content := "\033[48;2;80;40;40mthis is text with a background color that must wrap\033[49m"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1, "should wrap into multiple lines")
+		for i := 1; i < len(lines); i++ {
+			assert.Contains(t, lines[i], "\033[48;2;80;40;40m",
+				"continuation line %d should have bg color re-emitted", i)
+		}
+	})
+
+	t.Run("bg reset clears bg state before wrap", func(t *testing.T) {
+		content := "\033[48;2;80;40;40mhighlighted\033[49m and then plain text that is long enough to wrap"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1)
+		last := lines[len(lines)-1]
+		assert.NotContains(t, last, "\033[48;2;80;40;40m", "bg should not carry after bg reset")
+	})
+
+	t.Run("full reset clears bg state", func(t *testing.T) {
+		content := "\033[48;2;80;40;40m\033[38;2;100;200;50mstyled\033[0m plain text long enough to wrap here"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1)
+		last := lines[len(lines)-1]
+		assert.NotContains(t, last, "\033[48;2;80;40;40m", "bg should not carry after full reset")
+		assert.NotContains(t, last, "\033[38;2;100;200;50m", "fg should not carry after full reset")
+	})
+
+	t.Run("reverse video carries across wrap boundary", func(t *testing.T) {
+		content := "\033[7mthis is reverse video text that should wrap at boundary\033[27m"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1)
+		for i := 1; i < len(lines); i++ {
+			assert.Contains(t, lines[i], "\033[7m", "continuation line %d should have reverse video re-emitted", i)
+		}
+	})
+
+	t.Run("reverse video off clears state before wrap", func(t *testing.T) {
+		content := "\033[7mhighlighted\033[27m and then plain text that is long enough to wrap"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1)
+		last := lines[len(lines)-1]
+		assert.NotContains(t, last, "\033[7m", "reverse video should not carry after reset")
+	})
+
+	t.Run("full reset clears reverse video", func(t *testing.T) {
+		content := "\033[7m\033[1mreverse bold\033[0m plain text that is long enough to wrap here"
+		lines := m.wrapContent(content, 20)
+		require.Greater(t, len(lines), 1)
+		last := lines[len(lines)-1]
+		assert.NotContains(t, last, "\033[7m", "reverse should not carry after full reset")
+		assert.NotContains(t, last, "\033[1m", "bold should not carry after full reset")
+	})
+}
+
+func TestModel_ApplyIntraLineHighlight(t *testing.T) {
+	t.Run("paired add/remove lines get bg markers", func(t *testing.T) {
+		res := style.NewResolver(style.Colors{AddBg: "#1a3320", RemoveBg: "#331a1a", WordAddBg: "#2d5a3a", WordRemoveBg: "#5a2d2d"})
+		m := testModel(nil, nil)
+		m.resolver = res
+		m.renderer = style.NewRenderer(res)
+		m.sgr = style.SGR{}
+		m.modes.wordDiff = true
+		m.file.lines = []git.DiffLine{
+			{OldNum: 1, Content: "hello world", ChangeType: git.ChangeRemove},
+			{NewNum: 1, Content: "hello earth", ChangeType: git.ChangeAdd},
+		}
+		m.cfg.tabSpaces = "    "
+		m.recomputeIntraRanges()
+
+		// remove line should have word-diff ranges for "world"
+		require.NotNil(t, m.file.intraRanges[0], "remove line should have intra-line ranges")
+		result := m.applyIntraLineHighlight(0, git.ChangeRemove, "hello world")
+		assert.Contains(t, result, "\033[48;2;", "should contain bg ANSI sequence")
+
+		// add line should have word-diff ranges for "earth"
+		require.NotNil(t, m.file.intraRanges[1], "add line should have intra-line ranges")
+		result = m.applyIntraLineHighlight(1, git.ChangeAdd, "hello earth")
+		assert.Contains(t, result, "\033[48;2;", "should contain bg ANSI sequence")
+	})
+
+	t.Run("pure add block produces no markers", func(t *testing.T) {
+		res := style.NewResolver(style.Colors{AddBg: "#1a3320", WordAddBg: "#2d5a3a"})
+		m := testModel(nil, nil)
+		m.resolver = res
+		m.renderer = style.NewRenderer(res)
+		m.sgr = style.SGR{}
+		m.modes.wordDiff = true
+		m.file.lines = []git.DiffLine{
+			{NewNum: 1, Content: "new line one", ChangeType: git.ChangeAdd},
+			{NewNum: 2, Content: "new line two", ChangeType: git.ChangeAdd},
+		}
+		m.cfg.tabSpaces = "    "
+		m.recomputeIntraRanges()
+
+		assert.Nil(t, m.file.intraRanges[0], "pure add should have no intra-line ranges")
+		assert.Nil(t, m.file.intraRanges[1], "pure add should have no intra-line ranges")
+
+		result := m.applyIntraLineHighlight(0, git.ChangeAdd, "new line one")
+		assert.Equal(t, "new line one", result, "should return unchanged content")
+	})
+
+	t.Run("no-color mode uses reverse-video", func(t *testing.T) {
+		res := style.PlainResolver()
+		m := testModel(nil, nil)
+		m.cfg.noColors = true
+		m.resolver = res
+		m.renderer = style.NewRenderer(res)
+		m.sgr = style.SGR{}
+		m.modes.wordDiff = true
+		m.file.lines = []git.DiffLine{
+			{OldNum: 1, Content: "hello world", ChangeType: git.ChangeRemove},
+			{NewNum: 1, Content: "hello earth", ChangeType: git.ChangeAdd},
+		}
+		m.cfg.tabSpaces = "    "
+		m.recomputeIntraRanges()
+
+		require.NotNil(t, m.file.intraRanges[0])
+		result := m.applyIntraLineHighlight(0, git.ChangeRemove, "hello world")
+		assert.Contains(t, result, "\033[7m", "no-color should use reverse video on")
+		assert.Contains(t, result, "\033[27m", "no-color should use reverse video off")
+	})
+
+	t.Run("context lines are not highlighted", func(t *testing.T) {
+		m := testModel(nil, nil)
+		m.file.lines = []git.DiffLine{
+			{OldNum: 1, NewNum: 1, Content: "context", ChangeType: git.ChangeContext},
+		}
+		m.file.intraRanges = [][]worddiff.Range{{worddiff.Range{Start: 0, End: 3}}} // fake ranges
+
+		result := m.applyIntraLineHighlight(0, git.ChangeContext, "context")
+		assert.Equal(t, "context", result, "context lines should not get intra-line markers")
+	})
+
+	t.Run("out of range idx returns unchanged", func(t *testing.T) {
+		m := testModel(nil, nil)
+		m.file.intraRanges = nil
+		result := m.applyIntraLineHighlight(5, git.ChangeAdd, "text")
+		assert.Equal(t, "text", result)
+	})
+}
+
+func TestModel_RenderDiffWithIntraLine(t *testing.T) {
+	t.Run("render hunk with paired lines includes bg markers", func(t *testing.T) {
+		lines := []git.DiffLine{
+			{OldNum: 1, NewNum: 1, Content: "context line", ChangeType: git.ChangeContext},
+			{OldNum: 2, Content: "old value", ChangeType: git.ChangeRemove},
+			{NewNum: 2, Content: "new value", ChangeType: git.ChangeAdd},
+		}
+		res := style.NewResolver(style.Colors{
+			AddBg: "#1a3320", RemoveBg: "#331a1a",
+			WordAddBg: "#2d5a3a", WordRemoveBg: "#5a2d2d",
+			DiffBg: "#1e1e1e",
+		})
+		m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+		m.resolver = res
+		m.renderer = style.NewRenderer(res)
+		m.sgr = style.SGR{}
+		m.modes.wordDiff = true
+		result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+		m = result.(Model)
+
+		// intraRanges should be computed by handleFileLoaded
+		require.NotNil(t, m.file.intraRanges, "intra-line ranges should be computed")
+
+		output := m.renderDiff()
+		// "old" vs "new" are the changed words - the bg markers should appear
+		assert.Contains(t, output, "\033[48;2;", "rendered output should contain bg color sequences")
+	})
+
+	t.Run("tab-containing lines have correct highlights", func(t *testing.T) {
+		lines := []git.DiffLine{
+			{OldNum: 1, Content: "\treturn old", ChangeType: git.ChangeRemove},
+			{NewNum: 1, Content: "\treturn new", ChangeType: git.ChangeAdd},
+		}
+		res := style.NewResolver(style.Colors{
+			AddBg: "#1a3320", RemoveBg: "#331a1a",
+			WordAddBg: "#2d5a3a", WordRemoveBg: "#5a2d2d",
+		})
+		m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+		m.resolver = res
+		m.renderer = style.NewRenderer(res)
+		m.sgr = style.SGR{}
+		m.cfg.tabSpaces = "    "
+		m.modes.wordDiff = true
+		result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+		m = result.(Model)
+
+		require.NotNil(t, m.file.intraRanges)
+		output := m.renderDiff()
+		stripped := ansi.Strip(output)
+		// tab should be replaced, and content should be present
+		assert.Contains(t, stripped, "    return", "tabs should be replaced with spaces")
+		// the word "old"/"new" should be highlighted differently
+		assert.Contains(t, output, "\033[48;2;", "tab lines should have word-diff bg markers")
+	})
+}
+
+func TestModel_WrapModeWithIntraLine(t *testing.T) {
+	lines := []git.DiffLine{
+		{OldNum: 1, Content: "this is a long line with old word in it that needs to wrap because it is very long", ChangeType: git.ChangeRemove},
+		{NewNum: 1, Content: "this is a long line with new word in it that needs to wrap because it is very long", ChangeType: git.ChangeAdd},
+	}
+	res := style.NewResolver(style.Colors{
+		AddBg: "#1a3320", RemoveBg: "#331a1a",
+		WordAddBg: "#2d5a3a", WordRemoveBg: "#5a2d2d",
+	})
+	m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+	m.resolver = res
+	m.renderer = style.NewRenderer(res)
+	m.sgr = style.SGR{}
+	m.modes.wrap = true
+	m.layout.width = 50
+	m.layout.treeWidth = 0
+	m.file.singleFile = true
+	m.modes.wordDiff = true
+
+	result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+	m = result.(Model)
+
+	require.NotNil(t, m.file.intraRanges)
+	output := m.renderDiff()
+	// verify word-diff markers are present in wrapped output
+	assert.Contains(t, output, "\033[48;2;", "wrapped output should contain word-diff bg markers")
+}
+
+func TestModel_WordDiffOptIn(t *testing.T) {
+	lines := []git.DiffLine{
+		{OldNum: 1, Content: "old value here", ChangeType: git.ChangeRemove},
+		{NewNum: 1, Content: "new value here", ChangeType: git.ChangeAdd},
+	}
+	sc := style.Colors{AddBg: "#1a3320", RemoveBg: "#331a1a", WordAddBg: "#2d5a3a", WordRemoveBg: "#5a2d2d"}
+
+	t.Run("default off: no ranges computed", func(t *testing.T) {
+		res := style.NewResolver(sc)
+		m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+		m.resolver = res
+		m.renderer = style.NewRenderer(res)
+		m.sgr = style.SGR{}
+		result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+		m = result.(Model)
+
+		assert.False(t, m.modes.wordDiff, "wordDiff should default to false")
+		assert.Nil(t, m.file.intraRanges, "intraRanges should be nil when wordDiff is off")
+	})
+
+	t.Run("enabled: ranges computed on file load and bg markers in render", func(t *testing.T) {
+		res := style.NewResolver(sc)
+		m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+		m.resolver = res
+		m.renderer = style.NewRenderer(res)
+		m.sgr = style.SGR{}
+		m.modes.wordDiff = true
+		result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+		m = result.(Model)
+
+		require.NotNil(t, m.file.intraRanges, "intraRanges should be computed when wordDiff is on")
+		assert.Contains(t, m.renderDiff(), "\033[48;2;", "rendered output should contain word-diff bg markers")
+	})
+
+	t.Run("toggleWordDiff flips state and recomputes", func(t *testing.T) {
+		res := style.NewResolver(sc)
+		m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+		m.resolver = res
+		m.renderer = style.NewRenderer(res)
+		m.sgr = style.SGR{}
+		m.ready = true
+		m.layout.width = 200
+		m.layout.height = 30
+		m.layout.viewport.Width = 196
+		m.layout.viewport.Height = 28
+		result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+		m = result.(Model)
+		m.layout.focus = paneDiff
+
+		assert.Nil(t, m.file.intraRanges, "initial state: no ranges")
+
+		m.toggleWordDiff()
+		assert.True(t, m.modes.wordDiff, "should be enabled after toggle")
+		assert.NotNil(t, m.file.intraRanges, "ranges computed after enabling")
+
+		m.toggleWordDiff()
+		assert.False(t, m.modes.wordDiff, "should be disabled after second toggle")
+		assert.Nil(t, m.file.intraRanges, "ranges cleared after disabling")
+	})
+
+	t.Run("toggleWordDiff is no-op when no file loaded", func(t *testing.T) {
+		m := testModel(nil, nil)
+		m.layout.focus = paneDiff
+		m.toggleWordDiff()
+		assert.False(t, m.modes.wordDiff, "should stay off with no file")
+	})
+
+	t.Run("W key flips wordDiff through Update dispatch", func(t *testing.T) {
+		res := style.NewResolver(sc)
+		m := testModel([]string{"a.go"}, map[string][]git.DiffLine{"a.go": lines})
+		m.resolver = res
+		m.renderer = style.NewRenderer(res)
+		m.sgr = style.SGR{}
+		m.ready = true
+		m.layout.width = 200
+		m.layout.height = 30
+		m.layout.viewport.Width = 196
+		m.layout.viewport.Height = 28
+		result, _ := m.Update(fileLoadedMsg{file: "a.go", lines: lines})
+		m = result.(Model)
+		m.layout.focus = paneDiff
+
+		require.False(t, m.modes.wordDiff, "initial state: off")
+		require.Nil(t, m.file.intraRanges, "initial state: no ranges")
+
+		result, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'W'}})
+		m = result.(Model)
+		assert.True(t, m.modes.wordDiff, "W key should enable wordDiff")
+		assert.NotNil(t, m.file.intraRanges, "ranges should be computed after W")
+
+		result, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'W'}})
+		m = result.(Model)
+		assert.False(t, m.modes.wordDiff, "second W should disable wordDiff")
+		assert.Nil(t, m.file.intraRanges, "ranges should be cleared after second W")
+	})
+}
+
+func TestModel_RenderWrappedAnnotation_MultiLine(t *testing.T) {
+	newModel := func() Model {
+		m := testModel(nil, nil)
+		m.file.name = "a.go"
+		m.layout.width = 120
+		m.layout.treeWidth = 20
+		m.file.lines = []git.DiffLine{{NewNum: 1, Content: "line1", ChangeType: git.ChangeContext}}
+		m.layout.focus = paneDiff
+		return m
+	}
+
+	t.Run("three logical lines: all lines rendered, cursor on first row only", func(t *testing.T) {
+		m := newModel()
+		var b strings.Builder
+		cursor := m.renderer.DiffCursor(m.cfg.noColors)
+		m.renderWrappedAnnotation(&b, cursor, "\U0001f4ac ", "first\nsecond\nthird")
+		out := b.String()
+		assert.Contains(t, out, "first", "first logical line present")
+		assert.Contains(t, out, "second", "second logical line present")
+		assert.Contains(t, out, "third", "third logical line present")
+		rows := strings.Split(strings.TrimRight(out, "\n"), "\n")
+		require.Len(t, rows, 3, "three logical lines produce three rows")
+		// cursor on first row only
+		assert.Equal(t, 1, strings.Count(out, cursor), "cursor appears once on first row")
+		// continuation rows begin with leading space+indent (no cursor)
+		assert.True(t, strings.HasPrefix(rows[1], " "), "continuation row starts with space cursor column")
+		assert.True(t, strings.HasPrefix(rows[2], " "), "continuation row starts with space cursor column")
+		// continuation rows indented to align past emoji prefix
+		assert.Contains(t, rows[1], "   second", "second row aligned with 3-space indent past emoji")
+		assert.Contains(t, rows[2], "   third", "third row aligned with 3-space indent past emoji")
+	})
+
+	t.Run("file-level continuation uses 9-space indent", func(t *testing.T) {
+		m := newModel()
+		var b strings.Builder
+		cursor := m.renderer.DiffCursor(m.cfg.noColors)
+		m.renderWrappedAnnotation(&b, cursor, "\U0001f4ac file: ", "alpha\nbeta")
+		out := b.String()
+		rows := strings.Split(strings.TrimRight(out, "\n"), "\n")
+		require.Len(t, rows, 2)
+		// file-level emoji width = 9. continuation should have 9 spaces of indent
+		assert.Contains(t, rows[1], strings.Repeat(" ", 9)+"beta", "continuation indented to align past 💬 file: prefix")
+	})
+
+	t.Run("line-level body starting file colon uses line prefix indent", func(t *testing.T) {
+		m := newModel()
+		var b strings.Builder
+		cursor := m.renderer.DiffCursor(m.cfg.noColors)
+		m.renderWrappedAnnotation(&b, cursor, "\U0001f4ac ", "file: alpha\nbeta")
+		out := b.String()
+		rows := strings.Split(strings.TrimRight(out, "\n"), "\n")
+		require.Len(t, rows, 2)
+		assert.Contains(t, rows[1], strings.Repeat(" ", 3)+"beta", "line-level continuation should align past 💬 prefix")
+		assert.NotContains(t, rows[1], strings.Repeat(" ", 9)+"beta", "line-level body must not be treated as file-level prefix")
+	})
+
+	t.Run("two logical lines each wrap, counts grow", func(t *testing.T) {
+		m := newModel()
+		m.layout.width = 40 // narrow pane to force wrap
+		m.layout.treeWidth = 8
+		first := strings.Repeat("alpha ", 20)  // wraps multiple rows
+		second := strings.Repeat("bravo ", 20) // wraps multiple rows
+		body := first + "\n" + second
+		var b strings.Builder
+		cursor := m.renderer.DiffCursor(m.cfg.noColors)
+		m.renderWrappedAnnotation(&b, cursor, "\U0001f4ac ", body)
+		out := b.String()
+		rows := strings.Split(strings.TrimRight(out, "\n"), "\n")
+		assert.Greater(t, len(rows), 3, "both logical lines wrap beyond one row")
+		assert.Equal(t, 1, strings.Count(out, cursor), "cursor only on very first visual row")
+		assert.Contains(t, out, "alpha", "first logical line content present")
+		assert.Contains(t, out, "bravo", "second logical line content present")
+	})
+}
+
+// benchDiffLines builds a realistic mixed diff: context, added, and removed lines
+// in roughly the proportions a review diff has, with source-like content.
+func benchDiffLines(n int) []git.DiffLine {
+	lines := make([]git.DiffLine, n)
+	bodies := []string{
+		"func (s *Store) Get(key string) (Value, error) {",
+		"\tif v, ok := s.cache[key]; ok { return v, nil }",
+		"\treturn Value{}, fmt.Errorf(\"lookup %q: %w\", key, ErrMissing)",
+		"",
+		"// resolve walks the chain until a terminal node is reached",
+	}
+	oldNum, newNum := 1, 1
+	for i := range lines {
+		content := bodies[i%len(bodies)]
+		switch i % 7 {
+		case 3:
+			lines[i] = git.DiffLine{OldNum: oldNum, Content: content, ChangeType: git.ChangeRemove}
+			oldNum++
+		case 4:
+			lines[i] = git.DiffLine{NewNum: newNum, Content: content, ChangeType: git.ChangeAdd}
+			newNum++
+		default:
+			lines[i] = git.DiffLine{OldNum: oldNum, NewNum: newNum, Content: content, ChangeType: git.ChangeContext}
+			oldNum++
+			newNum++
+		}
+	}
+	return lines
+}
+
+// benchModel builds a Model with the production color palette and pre-computed
+// highlight strings, loaded with an n-line diff and sized to a typical terminal.
+func benchModel(b *testing.B, n int) Model {
+	b.Helper()
+	lines := benchDiffLines(n)
+	res := style.NewResolver(style.Colors{
+		Accent: "#D5895F", Border: "#585858", Normal: "#d0d0d0", Muted: "#585858",
+		SelectedFg: "#ffffaf", SelectedBg: "#D5895F", Annotation: "#ffd700", CursorFg: "#bbbb44",
+		AddFg: "#87d787", AddBg: "#123800", RemoveFg: "#ff8787", RemoveBg: "#4D1100",
+		ModifyFg: "#f5c542", ModifyBg: "#3D2E00", StatusFg: "#202020", StatusBg: "#C5794F",
+		SearchFg: "#1a1a1a", SearchBg: "#4a4a00",
+	})
+	renderer := &mocks.DiffSourceMock{
+		ChangedFilesFunc: func(string, bool) ([]git.FileEntry, error) {
+			return []git.FileEntry{{Path: "large.go"}}, nil
+		},
+		FileDiffFunc: func(git.FileDiffRequest) ([]git.DiffLine, error) { return lines, nil },
+	}
+	m, err := NewModel(ModelConfig{
+		DiffSource: renderer, Store: annot.NewStore(), Highlighter: noopHighlighter(),
+		StyleResolver: res, StyleRenderer: style.NewRenderer(res), SGR: style.SGR{},
+		WordDiffer: worddiff.New(), Overlay: overlay.NewManager(), Themes: fakeThemeCatalog{},
+		TreeWidthRatio: 3, AnnotationMarker: "\U0001f4ac",
+		NewFileTree: testFileTreeFactory(),
+	})
+	require.NoError(b, err)
+
+	res2, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 44})
+	m = res2.(Model)
+	res2, _ = m.Update(filesLoadedMsg{entries: []git.FileEntry{{Path: "large.go"}}})
+	m = res2.(Model)
+	// seq must match the load the file list just issued, or handleFileLoaded drops it as stale
+	res2, _ = m.Update(fileLoadedMsg{file: "large.go", seq: m.file.loadSeq, lines: lines})
+	m = res2.(Model)
+	require.True(b, m.ready && m.filesLoaded, "View must render the real layout, not a loading placeholder")
+	require.Len(b, m.file.lines, n, "renderDiff must walk the loaded diff, not the empty-file shortcut")
+
+	// syntax highlighting is pre-computed per file load in production. mirror that
+	// so renderDiff walks the highlighted path rather than the plain one.
+	highlighted := make([]string, len(lines))
+	for i, dl := range lines {
+		highlighted[i] = "\033[38;5;114m" + dl.Content + "\033[39m"
+	}
+	m.file.highlighted = highlighted
+	// handleFileLoaded already rendered and filled the cache while the highlighter returned
+	// nothing. without this the benchmark measures cached unhighlighted blocks
+	m.invalidateRenderCaches()
+	m.layout.focus = paneDiff
+	m.nav.diffCursor = len(lines) / 2
+	m.layout.viewport.SetContent(m.renderDiff())
+	m.layout.viewport.SetYOffset(m.nav.diffCursor)
+	return m
+}
+
+var benchDiffSizes = []int{500, 2_000, 10_000, 50_000}
+
+// BenchmarkModel_RenderDiff measures the full-diff re-render that every keystroke
+// during annotation triggers (annotate.go handleAnnotateKey).
+func BenchmarkModel_RenderDiff(b *testing.B) {
+	for _, n := range benchDiffSizes {
+		b.Run(fmt.Sprintf("lines=%d", n), func(b *testing.B) {
+			m := benchModel(b, n)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				sink = m.renderDiff()
+			}
+		})
+	}
+}
+
+// BenchmarkModel_View measures the per-frame cost that does NOT include a
+// full re-render: viewport slicing plus lipgloss pane assembly. Compare against
+// BenchmarkModel_RenderDiff to see how much of a keystroke is the re-render.
+func BenchmarkModel_View(b *testing.B) {
+	for _, n := range benchDiffSizes {
+		b.Run(fmt.Sprintf("lines=%d", n), func(b *testing.B) {
+			m := benchModel(b, n)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				sink = m.View()
+			}
+		})
+	}
+}
+
+// sink prevents the compiler from eliminating benchmark render calls.
+var sink string
+
+var updateGolden = flag.Bool("update-golden", false, "rewrite testdata goldens from current output")
+
+// goldenModel builds a deterministic model for the render golden. The content mixes change types,
+// tabs, wide runes and lines long enough to force horizontal scroll and wrapping, so the golden
+// exercises the gutter, styling, cut and pad paths rather than only the happy one.
+func goldenModel(t *testing.T) Model {
+	t.Helper()
+	lines := []git.DiffLine{
+		{OldNum: 1, NewNum: 1, Content: "package store", ChangeType: git.ChangeContext},
+		{OldNum: 2, NewNum: 2, Content: "", ChangeType: git.ChangeContext},
+		{Content: "⋯ 12 lines ⋯", ChangeType: git.ChangeDivider},
+		{OldNum: 15, Content: "\tif v, ok := s.cache[key]; ok {", ChangeType: git.ChangeRemove},
+		{NewNum: 15, Content: "\tif v, ok := s.cache[key]; ok && !v.stale {", ChangeType: git.ChangeAdd},
+		{OldNum: 16, NewNum: 16, Content: "\t\treturn v, nil", ChangeType: git.ChangeContext},
+		{NewNum: 17, Content: "\t// ленивая инвалидация — 日本語 mixed width", ChangeType: git.ChangeAdd},
+		{OldNum: 17, NewNum: 18, Content: strings.Repeat("long tail content that overflows the pane width ", 6), ChangeType: git.ChangeContext},
+		{OldNum: 18, Content: "\treturn Value{}, ErrMissing", ChangeType: git.ChangeRemove},
+		{NewNum: 19, Content: "\treturn Value{}, fmt.Errorf(\"lookup %q: %w\", key, ErrMissing)", ChangeType: git.ChangeAdd},
+		{OldNum: 19, NewNum: 20, Content: "}", ChangeType: git.ChangeContext},
+	}
+	res := style.NewResolver(style.Colors{
+		Accent: "#D5895F", Border: "#585858", Normal: "#d0d0d0", Muted: "#585858",
+		SelectedFg: "#ffffaf", SelectedBg: "#D5895F", Annotation: "#ffd700", CursorFg: "#bbbb44",
+		AddFg: "#87d787", AddBg: "#123800", RemoveFg: "#ff8787", RemoveBg: "#4D1100",
+		ModifyFg: "#f5c542", ModifyBg: "#3D2E00", StatusFg: "#202020", StatusBg: "#C5794F",
+		SearchFg: "#1a1a1a", SearchBg: "#4a4a00", DiffBg: "#1c1c1c",
+	})
+	renderer := &mocks.DiffSourceMock{
+		ChangedFilesFunc: func(string, bool) ([]git.FileEntry, error) {
+			return []git.FileEntry{{Path: "store.go"}}, nil
+		},
+		FileDiffFunc: func(git.FileDiffRequest) ([]git.DiffLine, error) { return lines, nil },
+	}
+	m, err := NewModel(ModelConfig{
+		DiffSource: renderer, Store: annot.NewStore(), Highlighter: noopHighlighter(),
+		StyleResolver: res, StyleRenderer: style.NewRenderer(res), SGR: style.SGR{},
+		WordDiffer: worddiff.New(), Overlay: overlay.NewManager(), Themes: fakeThemeCatalog{},
+		TreeWidthRatio: 3, AnnotationMarker: "\U0001f4ac",
+		NewFileTree: testFileTreeFactory(),
+	})
+	require.NoError(t, err)
+
+	m.layout.treeHidden = true // the harness pins a full-width diff pane
+	res2, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = res2.(Model)
+	res2, _ = m.Update(filesLoadedMsg{entries: []git.FileEntry{{Path: "store.go"}}})
+	m = res2.(Model)
+	res2, _ = m.Update(fileLoadedMsg{file: "store.go", seq: m.file.loadSeq, lines: lines})
+	m = res2.(Model)
+	require.Len(t, m.file.lines, len(lines))
+
+	highlighted := make([]string, len(lines))
+	for i, dl := range lines {
+		highlighted[i] = "\033[38;5;114m" + dl.Content + "\033[39m"
+	}
+	m.file.highlighted = highlighted
+	m.file.lineNumWidth = 2
+	m.layout.focus = paneDiff
+	m.nav.diffCursor = 0
+	return m
+}
+
+// goldenStates enumerates the render states the golden covers. Each mutator receives a fresh
+// model from goldenModel, so states never leak into each other.
+func goldenStates() []struct {
+	name  string
+	apply func(t *testing.T, m *Model)
+} {
+	return []struct {
+		name  string
+		apply func(t *testing.T, m *Model)
+	}{
+		{"baseline-cursor-first", func(t *testing.T, m *Model) {}},
+		{"cursor-mid", func(t *testing.T, m *Model) { m.nav.diffCursor = 5 }},
+		{"cursor-last", func(t *testing.T, m *Model) { m.nav.diffCursor = len(m.file.lines) - 1 }},
+		{"cursor-on-divider", func(t *testing.T, m *Model) { m.nav.diffCursor = 2 }},
+		{"tree-pane-focused", func(t *testing.T, m *Model) { m.layout.focus = paneTree }},
+		{"line-numbers", func(t *testing.T, m *Model) { m.modes.lineNumbers = true }},
+		{"wrap", func(t *testing.T, m *Model) { m.modes.wrap = true }},
+		{"wrap-and-line-numbers", func(t *testing.T, m *Model) { m.modes.wrap = true; m.modes.lineNumbers = true }},
+		{"blame", func(t *testing.T, m *Model) {
+			m.modes.showBlame = true
+			m.file.blameAuthorLen = 6
+			// relative, not absolute: RelativeAge buckets by whole hours under 24h, so a
+			// hardcoded instant bakes the hour-of-generation into the golden and goes red at
+			// the next bucket boundary. an offset from now always renders "3h".
+			blameAt := time.Now().Add(-3*time.Hour - 30*time.Minute)
+			m.file.blameData = map[int]git.BlameLine{
+				1: {Author: "eugene", Time: blameAt}, 15: {Author: "paskal", Time: blameAt},
+				16: {Author: "eugene", Time: blameAt}, 20: {Author: "quetz", Time: blameAt},
+			}
+		}},
+		{"scrolled-right", func(t *testing.T, m *Model) { m.layout.scrollX = 24 }},
+		{"narrow-pane", func(t *testing.T, m *Model) { m.layout.width = 46; m.layout.treeWidth = 12 }},
+		{"tree-hidden", func(t *testing.T, m *Model) {
+			// isolates contentWidth via the treePaneHidden branch: width and treeWidth are
+			// untouched, but diffContentWidth switches from width-treeWidth-6 to width-4
+			m.layout.treeHidden = true
+		}},
+		{"search-matches", func(t *testing.T, m *Model) {
+			m.search.term = "return"
+			m.search.matches = []int{5, 8, 9}
+		}},
+		{"search-other-term", func(t *testing.T, m *Model) {
+			// same match set as search-matches, different term: the only shape that catches a
+			// term missing from globalRenderKey, since searchMatch stays true on every row
+			m.search.term = "eturn"
+			m.search.matches = []int{5, 8, 9}
+		}},
+		{"word-diff", func(t *testing.T, m *Model) {
+			m.modes.wordDiff = true
+			m.file.intraRanges = make([][]worddiff.Range, len(m.file.lines))
+			m.file.intraRanges[3] = []worddiff.Range{{Start: 20, End: 23}}
+			m.file.intraRanges[4] = []worddiff.Range{{Start: 20, End: 34}}
+		}},
+		{"empty-body-annotation", func(t *testing.T, m *Model) {
+			// reachable via --annotations. must still reserve and paint a prefix-only row
+			m.store.Add(annot.Annotation{File: "store.go", Line: 16, Type: " ", Comment: ""})
+		}},
+		{"annotations", func(t *testing.T, m *Model) {
+			m.store.Add(annot.Annotation{File: "store.go", Line: 15, Type: "+", Comment: "use errors.Is here"})
+			m.store.Add(annot.Annotation{File: "store.go", Line: 20, Type: " ", Comment: "multi\nline\nannotation body"})
+		}},
+		{"annotation-cursor", func(t *testing.T, m *Model) {
+			m.store.Add(annot.Annotation{File: "store.go", Line: 15, Type: "+", Comment: "use errors.Is here"})
+			m.nav.diffCursor = 4
+			m.nav.onAnnotationRow = true
+		}},
+		{"file-annotation", func(t *testing.T, m *Model) {
+			m.store.Add(annot.Annotation{File: "store.go", Line: 0, Comment: "file-level note"})
+			m.nav.diffCursor = -1
+		}},
+		{"live-input", func(t *testing.T, m *Model) {
+			m.nav.diffCursor = 4
+			m.startAnnotation()
+			m.annot.input.SetValue("typed so far")
+		}},
+		{"live-file-input", func(t *testing.T, m *Model) {
+			m.startFileAnnotation()
+			m.annot.input.SetValue("file note in progress")
+		}},
+		{"collapsed", func(t *testing.T, m *Model) { m.modes.collapsed.enabled = true }},
+		{"no-colors", func(t *testing.T, m *Model) { m.cfg.noColors = true }},
+	}
+}
+
+// renderGolden renders every state and returns one labeled document.
+func renderGolden(t *testing.T) string {
+	t.Helper()
+	var b strings.Builder
+	for _, st := range goldenStates() {
+		m := goldenModel(t)
+		st.apply(t, &m)
+		b.WriteString("===== " + st.name + " =====\n")
+		b.WriteString(m.renderDiff())
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// TestModel_RenderDiffGolden pins renderDiff's exact bytes across the render states that the
+// per-line cache has to reproduce. It is an equivalence harness, not a description of correct
+// output: regenerate with -update-golden only after confirming a diff is an intended change.
+func TestModel_RenderDiffGolden(t *testing.T) {
+	got := renderGolden(t)
+	path := filepath.Join("testdata", "renderdiff.golden")
+
+	if *updateGolden {
+		require.NoError(t, os.MkdirAll("testdata", 0o750))
+		require.NoError(t, os.WriteFile(path, []byte(got), 0o600))
+		t.Log("golden updated:", path)
+		return
+	}
+
+	want, err := os.ReadFile(path) //nolint:gosec // fixed test path
+	require.NoError(t, err, "golden missing — regenerate with: go test ./internal/tui/ -run RenderDiffGolden -update-golden")
+	assert.Equal(t, string(want), got, "renderDiff output changed, if intended regenerate with -update-golden")
+}
+
+// TestModel_RenderDiffCacheMatchesColdRender catches stale cached blocks, which the golden
+// structurally cannot: the golden always renders on a fresh model, so it only sees a wrong
+// render, never a leftover one. Here each state is reached on a model whose cache was filled
+// under a different state, so a render input missing from globalRenderKey shows up as a block
+// from the previous state.
+//
+// Its reach is exactly goldenStates: a field is covered only when two states differ in it AND
+// still hit the cache. A state pair that changes something already in the key just misses and
+// proves nothing. searchTerm was missing from the key and this test passed anyway, because the
+// only search state made every pair flip searchMatch. Adding a field to the key means adding a
+// state that isolates it.
+func TestModel_RenderDiffCacheMatchesColdRender(t *testing.T) {
+	states := goldenStates()
+	for _, prev := range states {
+		for _, next := range states {
+			if prev.name == next.name {
+				continue
+			}
+			t.Run(prev.name+"_then_"+next.name, func(t *testing.T) {
+				cold := goldenModel(t)
+				next.apply(t, &cold)
+				want := cold.renderDiff()
+
+				warmer := goldenModel(t)
+				prev.apply(t, &warmer)
+				warmer.renderDiff() // fills the cache with blocks rendered under prev
+
+				// carry only the dirty cache into a model that is otherwise clean, so the two
+				// states' mutations never stack - this is a stale cache, not a merged state
+				got := goldenModel(t)
+				got.renderCache = warmer.renderCache
+				next.apply(t, &got)
+				assert.Equal(t, want, got.renderDiff(), "cached render differs from a cold one")
+			})
+		}
+	}
+}
+
+func TestDiffRenderCache(t *testing.T) {
+	flags := func(cursor bool) lineRenderFlags { return lineRenderFlags{cursor: cursor} }
+	key := func(w int) globalRenderKey { return globalRenderKey{contentWidth: w} }
+
+	t.Run("serves a block rendered under identical flags", func(t *testing.T) {
+		c := &diffRenderCache{}
+		c.rebase(key(80), 3)
+		c.put(1, flags(false), "block")
+		got, ok := c.get(1, flags(false))
+		assert.True(t, ok)
+		assert.Equal(t, "block", got)
+	})
+
+	t.Run("misses when per-line flags differ", func(t *testing.T) {
+		c := &diffRenderCache{}
+		c.rebase(key(80), 3)
+		c.put(1, flags(false), "block")
+		_, ok := c.get(1, flags(true))
+		assert.False(t, ok)
+	})
+
+	t.Run("rebase drops entries when the global key changes", func(t *testing.T) {
+		c := &diffRenderCache{}
+		c.rebase(key(80), 3)
+		c.put(1, flags(false), "block")
+		c.rebase(key(120), 3)
+		_, ok := c.get(1, flags(false))
+		assert.False(t, ok)
+	})
+
+	t.Run("rebase drops entries when the line count changes", func(t *testing.T) {
+		c := &diffRenderCache{}
+		c.rebase(key(80), 3)
+		c.put(1, flags(false), "block")
+		c.rebase(key(80), 9)
+		_, ok := c.get(1, flags(false))
+		assert.False(t, ok)
+		assert.Len(t, c.blocks, 9)
+	})
+
+	t.Run("live input row is never stored or served", func(t *testing.T) {
+		c := &diffRenderCache{}
+		c.rebase(key(80), 3)
+		live := lineRenderFlags{liveInput: true}
+		c.put(1, live, "typed")
+		_, ok := c.get(1, live)
+		assert.False(t, ok, "must not serve the live input row")
+		assert.False(t, c.filled[1], "must not store the live input row")
+	})
+
+	t.Run("out of range indices are ignored", func(t *testing.T) {
+		c := &diffRenderCache{}
+		c.rebase(key(80), 2)
+		assert.NotPanics(t, func() { c.put(5, flags(false), "x"); c.put(-1, flags(false), "x") })
+		_, ok := c.get(5, flags(false))
+		assert.False(t, ok)
+		_, ok = c.get(-1, flags(false))
+		assert.False(t, ok)
+	})
+
+	t.Run("clear resets lastLen so a small file does not pre-size from a large one", func(t *testing.T) {
+		c := &diffRenderCache{}
+		c.rebase(key(80), 3)
+		c.put(1, flags(false), "block")
+		c.lastLen = 5_000_000
+		c.clear()
+		assert.Zero(t, c.lastLen, "estimate belongs to content that is gone")
+		_, ok := c.get(1, flags(false))
+		assert.False(t, ok)
+	})
+
+	t.Run("rebase keeps lastLen so the rebuilt render is still pre-sized", func(t *testing.T) {
+		// the render that follows a key change misses on every line and is the expensive
+		// one. zeroing the estimate here would skip Grow on exactly that render
+		c := &diffRenderCache{}
+		c.rebase(key(80), 3)
+		c.lastLen = 4096
+		c.rebase(key(120), 3)
+		assert.Equal(t, 4096, c.lastLen)
+	})
+}
+
+// BenchmarkModel_AnnotatedKeystroke covers the workflow the cache exists for and that the
+// other benchmarks miss: a file that already carries annotations, where every render still
+// has to resolve each line against the annotation map.
+func BenchmarkModel_AnnotatedKeystroke(b *testing.B) {
+	for _, n := range benchDiffSizes {
+		b.Run(fmt.Sprintf("lines=%d", n), func(b *testing.B) {
+			m := benchModel(b, n)
+			for i := 4; i < n; i += n/4 + 1 {
+				m.store.Add(annot.Annotation{File: "large.go", Line: i, Type: " ", Comment: "note"})
+			}
+			m.invalidateRenderCaches()
+			m.startAnnotation()
+			key := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				res, _ := m.Update(key)
+				m = res.(Model)
+				sink = m.View()
+			}
+		})
+	}
+}
+
+func TestModel_InvalidateRenderCaches(t *testing.T) {
+	m := testModel(nil, nil)
+	m.file.name = "a.go"
+	m.layout.width = 120
+	m.layout.treeWidth = 20
+
+	m.annotationVisualRows("\U0001f4ac ", "one")
+	m.annotationVisualRows("\U0001f4ac ", "two")
+	require.Len(t, m.annot.rowCache, 2)
+
+	m.file.lines = []git.DiffLine{{NewNum: 1, Content: "ctx", ChangeType: git.ChangeContext}}
+	m.renderCache.rebase(globalRenderKey{contentWidth: 120}, 1)
+	m.renderCache.put(0, lineRenderFlags{}, "cached block")
+	m.renderCache.lastLen = 4096
+
+	m.invalidateRenderCaches()
+	assert.Empty(t, m.annot.rowCache)
+	_, ok := m.renderCache.get(0, lineRenderFlags{})
+	assert.False(t, ok, "diff render blocks must be dropped too, not just annotation rows")
+	assert.Zero(t, m.renderCache.lastLen, "size estimate belongs to content that is gone")
+
+	// cache must be usable after invalidation (not nil-mapped into a no-op)
+	m.annotationVisualRows("\U0001f4ac ", "after")
+	assert.Len(t, m.annot.rowCache, 1)
+}
+
+// TestModel_HandleFileLoaded_InvalidatesRenderCaches pins the file-load
+// invalidation hook. handleFileLoaded must call invalidateRenderCaches so neither
+// per-file annotation rows nor cached diff blocks leak across files.
+func TestModel_HandleFileLoaded_InvalidatesRenderCaches(t *testing.T) {
+	m := testModel([]string{"a.go", "b.go"}, nil)
+	m.tree = testNewFileTree([]string{"a.go", "b.go"})
+	m.file.name = "a.go"
+	m.layout.width = 120
+	m.layout.treeWidth = 20
+
+	// populate the cache from the "current file" state
+	m.annotationVisualRows("\U0001f4ac ", "one")
+	m.annotationVisualRows("\U0001f4ac ", "two")
+	require.Len(t, m.annot.rowCache, 2)
+	m.renderCache.rebase(globalRenderKey{contentWidth: 120}, 1)
+	m.renderCache.put(0, lineRenderFlags{}, "block from a.go")
+
+	lines := []git.DiffLine{{NewNum: 1, Content: "package main", ChangeType: git.ChangeContext}}
+	result, _ := m.Update(fileLoadedMsg{file: "b.go", lines: lines})
+	model := result.(Model)
+
+	assert.Empty(t, model.annot.rowCache, "annotation rows must be cleared after file load")
+	// handleFileLoaded re-renders after invalidating, so the cache is legitimately warm
+	// again for b.go. what must not survive is a block belonging to a.go
+	block, _ := model.renderCache.get(0, lineRenderFlags{})
+	assert.NotEqual(t, "block from a.go", block, "a block from the previous file must not survive the switch")
+}
+
+// TestModel_ApplyTheme_InvalidatesRenderCaches pins the theme-apply
+// invalidation hook. both memos bake in resolver styling and the resolver is not
+// comparable so it cannot live in globalRenderKey, making this call the only thing
+// standing between a theme change and stale colors.
+func TestModel_ApplyTheme_InvalidatesRenderCaches(t *testing.T) {
+	renderer := &mocks.DiffSourceMock{
+		ChangedFilesFunc: func(string, bool) ([]git.FileEntry, error) { return nil, nil },
+		FileDiffFunc:     func(git.FileDiffRequest) ([]git.DiffLine, error) { return nil, nil },
+	}
+	highlighter := &mocks.SyntaxHighlighterMock{
+		HighlightLinesFunc: func(string, []git.DiffLine) []string { return nil },
+		SetStyleFunc:       func(string) bool { return true },
+		StyleNameFunc:      func() string { return "orig-style" },
+	}
+	m := testNewModel(t, renderer, annot.NewStore(), highlighter, ModelConfig{
+		TreeWidthRatio: 3, Overlay: overlay.NewManager(),
+	})
+	m.file.name = "a.go"
+	m.layout.width = 120
+	m.layout.treeWidth = 20
+
+	m.annotationVisualRows("\U0001f4ac ", "one")
+	m.annotationVisualRows("\U0001f4ac ", "two")
+	require.Len(t, m.annot.rowCache, 2)
+	m.renderCache.rebase(globalRenderKey{contentWidth: 120}, 1)
+	m.renderCache.put(0, lineRenderFlags{}, "block under the old theme")
+
+	m.applyTheme(ThemeSpec{
+		Colors: style.Colors{
+			Accent: "#bd93f9", Border: "#6272a4", Normal: "#f8f8f2", Muted: "#6272a4",
+			SelectedFg: "#f8f8f2", SelectedBg: "#44475a", Annotation: "#f1fa8c",
+			CursorFg: "#282a36", CursorBg: "#f8f8f2",
+			AddFg: "#50fa7b", AddBg: "#2a4a2a", RemoveFg: "#ff5555", RemoveBg: "#4a2a2a",
+			ModifyFg: "#ffb86c", ModifyBg: "#3a3a2a",
+			TreeBg: "#21222c", DiffBg: "#282a36",
+			StatusFg: "#f8f8f2", StatusBg: "#44475a",
+			SearchFg: "#282a36", SearchBg: "#f1fa8c",
+		},
+		ChromaStyle: "dracula",
+	})
+
+	assert.Empty(t, m.annot.rowCache, "annotation rows must be cleared after applyTheme")
+	_, ok := m.renderCache.get(0, lineRenderFlags{})
+	assert.False(t, ok, "diff blocks bake in resolver colors and must not survive a theme change")
+}
