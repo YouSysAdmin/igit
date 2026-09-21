@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -38,13 +39,16 @@ func remoteNoteModel(t *testing.T) (Model, []git.DiffLine) {
 func TestModel_RemoteNotesAnchorToTheirLines(t *testing.T) {
 	m, lines := remoteNoteModel(t)
 
-	assert.Len(t, m.remoteByKey, 3, "unanchored and other-file notes are ignored")
+	assert.Len(t, m.remoteByKey, 4, "other-file notes are ignored, an unanchored one falls to the file block")
 	require.Len(t, m.remoteByKey["2:+"], 1)
 	assert.Equal(t, "alice", m.remoteByKey["2:+"][0].Author)
 	require.Len(t, m.remoteByKey["2:-"], 1)
 	assert.Equal(t, "bob", m.remoteByKey["2:-"][0].Author)
 	require.Len(t, m.remoteByKey["3: "], 1)
 	assert.Equal(t, "carol", m.remoteByKey["3: "][0].Author, "a LEFT note on a context line lands on that context row")
+	require.Len(t, m.remoteByKey[annotKeyFile], 1)
+	assert.Equal(t, "dan", m.remoteByKey[annotKeyFile][0].Author, "a note the diff does not show stays readable on the file")
+	assert.True(t, m.remoteByKey[annotKeyFile][0].atFile)
 
 	assert.Equal(t, map[annotLineKey]string{{line: 2, changeType: git.ChangeAdd}: "mine"}, m.decorations().comments,
 		"the annotation map stays the session's own work")
@@ -98,4 +102,68 @@ func TestRemoteNote_text(t *testing.T) {
 	assert.Equal(t, "@a: b", RemoteNote{Author: "a", Body: "b"}.text())
 	assert.Equal(t, "b", RemoteNote{Body: "b"}.text())
 	assert.Nil(t, groupRemoteNotes(nil))
+}
+
+func TestModel_FileLevelRemoteNotesOccupyTheFileBlock(t *testing.T) {
+	m, _ := remoteNoteModel(t)
+
+	assert.True(t, m.hasFileRow(), "a remote note on the file gives the file block its row")
+	assert.False(t, m.hasFileAnnotation(), "the store still holds no file-level annotation of our own")
+
+	rows := m.wrappedAnnotationLineCount(annotKeyFile)
+	assert.Positive(t, rows, "the height query reserves rows for it")
+
+	var b strings.Builder
+	m.renderFileAnnotationHeader(&b, m.decorations())
+	assert.Equal(t, rows, strings.Count(b.String(), "\n"), "the painter draws exactly what the height query counts")
+	assert.Contains(t, b.String(), "dan", "the note is readable")
+}
+
+func TestRemoteNote_textSaysWhereItCameFrom(t *testing.T) {
+	live := RemoteNote{File: "a.go", Line: 3, Author: "alice", Body: "looks off"}
+	assert.Equal(t, "@alice: looks off", live.text())
+
+	outdated := RemoteNote{File: "a.go", Author: "bob", Body: "needs a guard", Outdated: true, OrigLine: 73}
+	assert.Equal(t, "(outdated a.go:73) @bob: needs a guard", outdated.text())
+
+	renamed := RemoteNote{File: "new.go", Author: "carol", Body: "here", Outdated: true, OrigPath: "old.go", OrigLine: 4}
+	assert.Equal(t, "(outdated old.go:4) @carol: here", renamed.text())
+
+	detached := RemoteNote{File: "a.go", Line: 99, Author: "dan", Body: "outside", atFile: true}
+	assert.Equal(t, "(a.go:99) @dan: outside", detached.text())
+}
+
+func TestModel_AnnotationRowsCarryNoCarriageReturn(t *testing.T) {
+	m, _ := remoteNoteModel(t)
+	rows := m.annotationVisualRows("x ", "one\r\ntwo\rthree")
+	require.Len(t, rows, 3, "every line ending starts a row, whatever shape it arrived in")
+	for _, r := range rows {
+		assert.NotContains(t, r, "\r", "a bare CR would overwrite the row it was drawn on")
+	}
+}
+
+// TestModel_FileBlockHeightMatchesPaintForMultilineNotes uses the shape that
+// broke the pane: a request comment with CRLF endings and several lines. The
+// height query and the painter must agree or every row below the block is
+// drawn at the wrong offset.
+func TestModel_FileBlockHeightMatchesPaintForMultilineNotes(t *testing.T) {
+	body := "1. For long arrays of values, a YAML array should be used.\n" +
+		"2. A name for an array of values must be used in the plural (s) 'routes:'\n" +
+		"3. Values should be enclosed in quotes to indicate to Ansible that they are strings."
+	m := testNewModel(t, plainRenderer(), annot.NewStore(), noopHighlighter(), ModelConfig{RemoteNotes: []RemoteNote{
+		{File: "a.go", Author: "YouSysAdmin", Body: body, Outdated: true, OrigLine: 31},
+	}})
+	m.file.name = "a.go"
+	m.file.lines = []git.DiffLine{{OldNum: 1, NewNum: 1, Content: "ctx", ChangeType: git.ChangeContext}}
+	m.remoteByKey = m.indexRemoteNotes()
+
+	require.Len(t, m.remoteByKey[annotKeyFile], 1, "a note with no line belongs to the file")
+
+	var b strings.Builder
+	m.renderFileAnnotationHeader(&b, m.decorations())
+	painted := strings.Count(b.String(), "\n")
+	assert.Equal(t, m.wrappedAnnotationLineCount(annotKeyFile), painted,
+		"the rows the layout reserves are the rows the painter draws")
+	assert.GreaterOrEqual(t, painted, 3, "each line of the comment gets its own row")
+	assert.NotContains(t, b.String(), "\r")
 }

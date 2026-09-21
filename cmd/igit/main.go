@@ -143,12 +143,19 @@ func run(opts options) error {
 	var reviewLabel string
 	var prNumber int
 	var prHead, prKind, prNoun string
+	var prBaseline, startNote string
 	if opts.prSubcommand {
-		sess, perr := preparePullRequest(context.Background(), opts.prRef, forge.Kind(opts.Forge), pick, os.Stderr)
+		sess, perr := preparePullRequest(context.Background(), prRequest{
+			ref: opts.prRef, forge: forge.Kind(opts.Forge), since: opts.Review.Since,
+			opts: opts, pickFor: pick, warn: os.Stderr,
+		})
 		if perr != nil {
 			return perr
 		}
-		opts.Refs.Base, opts.Refs.Against = sess.pr.MergeBase, sess.pr.HeadSHA
+		// the displayed range may be narrower than the request's own diff, but
+		// annotations are anchored and saved against the request either way
+		opts.Refs.Base, opts.Refs.Against = cmp.Or(sess.baseline, sess.pr.MergeBase), sess.pr.HeadSHA
+		opts.prFullRef = sess.pr.Ref()
 		prReview = prReviewer{pr: sess.pr, hub: sess.hub}
 		prNotes = sess.notes
 		reviewLabel = sess.pr.Label()
@@ -156,6 +163,11 @@ func run(opts options) error {
 		prHead = shortSHA(sess.pr.HeadSHA)
 		prKind = sess.pr.ScopeKind()
 		prNoun = sess.pr.Noun()
+		if sess.baseline != "" {
+			prBaseline = shortSHA(sess.baseline)
+			reviewLabel += " since " + prBaseline
+			startNote = fmt.Sprintf("showing %s since %s, the full request is igit pr %d", sess.pr.Name(), prBaseline, sess.pr.Number)
+		}
 	}
 
 	setup, err := setupDiffSource(opts)
@@ -240,9 +252,10 @@ func run(opts options) error {
 		ShowUntracked:    opts.startupUntracked(),
 		WordDiff:         opts.Display.WordDiff,
 		ReviewInfo: reviewInfoFromOptions(opts, reviewInfoInputs{
-			workDir: workDir,
-			isGit:   isGit,
-			label:   reviewLabel,
+			workDir:  workDir,
+			isGit:    isGit,
+			label:    reviewLabel,
+			baseline: prBaseline,
 		}),
 		TabWidth:          opts.Display.TabWidth,
 		Ref:               opts.ref(),
@@ -266,7 +279,7 @@ func run(opts options) error {
 	modes := resolveModes(modeInputs{opts: opts, keymap: kms.Commit, review: reviewCfg, gitRoot: gitRoot, workDir: workDir, isGit: isGit, inProgress: inProgress})
 	app, err := tui.NewApp(tui.AppConfig{
 		Review: reviewCfg, Commit: modes.commit, PlanApplier: modes.planner,
-		Unavailable: modes.unavailable, StartMode: modes.start, StartNote: modes.startNote,
+		Unavailable: modes.unavailable, StartMode: modes.start, StartNote: cmp.Or(modes.startNote, startNote),
 	})
 	if err != nil {
 		return fmt.Errorf("create model: %w", err)

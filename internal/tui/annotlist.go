@@ -1,36 +1,74 @@
 package tui
 
 import (
+	"cmp"
+	"maps"
+	"slices"
+
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/yousysadmin/igit/internal/annot"
+	"github.com/yousysadmin/igit/internal/git"
 	"github.com/yousysadmin/igit/internal/tui/overlay"
 )
 
-// buildAnnotListItems builds a flat list of all annotations across all files.
-// Items are ordered by file name then line number, as returned by the store
-// (alphabetical via Store.Files, line-ascending via Store.Get with file-level
-// Line=0 first within each file). This combined ordering is load-bearing: both
-// the @ popup and the }/{ walker in annotnav.go iterate this exact sequence,
-// so changes to Store.Files / Store.Get ordering must keep the two consumers
-// in sync.
-func (m *Model) buildAnnotListItems() []annot.Annotation {
-	files := m.store.Files()
-	items := make([]annot.Annotation, 0, m.store.Count())
-	for _, f := range files {
-		items = append(items, m.store.Get(f)...)
+// annotListItem is one row of the annotation list: the session's own
+// annotation, or a comment the request already carries. Both are jump targets,
+// only the first is the session's to edit. A request comment numbers its line
+// on one side of the diff, which the jump needs to find the row.
+type annotListItem struct {
+	annot.Annotation
+	remote bool
+	side   string // LEFT or RIGHT for a request comment, empty for our own
+}
+
+// buildAnnotListItems builds a flat list of everything attached to the review:
+// the session's annotations and the comments the request already carries.
+// Items are ordered by file name then line number, with file-level entries
+// (Line=0) first within each file and our own annotation ahead of a request
+// comment on the same line. This combined ordering is load-bearing: both the @
+// popup and the }/{ walker in annotnav.go iterate this exact sequence, so
+// changes here must keep the two consumers in sync.
+func (m *Model) buildAnnotListItems() []annotListItem {
+	items := make([]annotListItem, 0, m.store.Count())
+	for _, f := range slices.Sorted(maps.Keys(m.annotatedFiles())) {
+		start := len(items)
+		for _, a := range m.store.Get(f) {
+			items = append(items, annotListItem{Annotation: a})
+		}
+		for _, n := range m.remoteNotes[f] {
+			items = append(items, annotListItem{
+				Annotation: annot.Annotation{File: f, Line: n.Line, Type: remoteChangeType(n.Side), Comment: n.text()},
+				remote:     true,
+				side:       cmp.Or(n.Side, "RIGHT"),
+			})
+		}
+		// stable, so our own annotations keep their place ahead of the
+		// request's comments on the same line
+		slices.SortStableFunc(items[start:], func(a, b annotListItem) int {
+			return cmp.Compare(a.Line, b.Line)
+		})
 	}
 	return items
 }
 
-// buildAnnotListSpec builds an overlay.AnnotListSpec from the annotation store.
+// remoteChangeType is the diff side a request comment reads as: removed lines
+// are numbered on the old file, everything else on the new one.
+func remoteChangeType(side string) string {
+	if side == "LEFT" {
+		return "-"
+	}
+	return "+"
+}
+
+// buildAnnotListSpec builds an overlay.AnnotListSpec from the annotation list.
 func (m Model) buildAnnotListSpec() overlay.AnnotListSpec {
 	annots := m.buildAnnotListItems()
 	items := make([]overlay.AnnotationItem, len(annots))
 	for i, a := range annots {
 		items[i] = overlay.AnnotationItem{
-			File: a.File, ChangeType: a.Type, Line: a.Line,
-			Comment: a.Comment,
+			AnnotationTarget: overlay.AnnotationTarget{File: a.File, ChangeType: a.Type, Line: a.Line, Side: a.side},
+			Comment:          a.Comment,
 		}
 	}
 	return overlay.AnnotListSpec{Items: items}
@@ -56,25 +94,57 @@ func (m Model) tryJumpToAnnotationTarget(target *overlay.AnnotationTarget) (tea.
 	if target == nil {
 		return m, nil, false
 	}
-	a := annot.Annotation{File: target.File, Line: target.Line, Type: target.ChangeType}
+	j := annotJump{
+		Annotation: annot.Annotation{File: target.File, Line: target.Line, Type: target.ChangeType},
+		side:       target.Side,
+	}
 
-	if a.File == m.file.name {
-		if a.Line != 0 && m.findDiffLineIndex(a.Line, a.Type) < 0 {
+	if j.File == m.file.name {
+		if j.Line != 0 && m.resolveJumpIndex(j) < 0 {
 			return m, nil, false
 		}
-		m.positionOnAnnotation(a)
+		m.positionOnAnnotation(j)
 		return m, nil, true
 	}
 
 	if m.file.singleFile {
 		return m, nil, false
 	}
-	if !m.tree.SelectByPath(a.File) {
+	if !m.tree.SelectByPath(j.File) {
 		return m, nil, false
 	}
-	m.pendingAnnotJump = &a
+	m.pendingAnnotJump = &j
 	model, cmd := m.loadSelectedIfChanged()
 	return model, cmd, true
+}
+
+// annotJump is a resolved jump target: an annotation position plus, for a
+// request comment, the side its line is numbered on.
+type annotJump struct {
+	annot.Annotation
+	side string // LEFT or RIGHT for a request comment, empty for our own
+}
+
+// resolveJumpIndex is the diff row a jump target points at. Our own
+// annotations name their change type exactly. A request comment names only a
+// side, and the line it numbers is either a changed row or a context row, so
+// both are tried in that order, the way the notes themselves are anchored.
+func (m Model) resolveJumpIndex(j annotJump) int {
+	if j.side == "" {
+		return m.findDiffLineIndex(j.Line, j.Type)
+	}
+	primary, num := git.ChangeAdd, func(dl git.DiffLine) int { return dl.NewNum }
+	if j.side == "LEFT" {
+		primary, num = git.ChangeRemove, func(dl git.DiffLine) int { return dl.OldNum }
+	}
+	for _, want := range []git.ChangeType{primary, git.ChangeContext} {
+		for i, dl := range m.file.lines {
+			if dl.ChangeType == want && num(dl) == j.Line {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 // positionOnAnnotation moves the cursor to the given annotation's line, re-renders, and centers the viewport.
@@ -83,12 +153,12 @@ func (m Model) tryJumpToAnnotationTarget(target *overlay.AnnotationTarget) (tea.
 // matching what `j`/`k` navigation produces when stepping onto an annotated line. File-level annotations
 // (Line=0) use diffCursor=-1 which already represents the annotation row directly. Without this flag the
 // cursor would land on the diff line above the comment, leaving navigation visually one row off the target.
-func (m *Model) positionOnAnnotation(a annot.Annotation) {
+func (m *Model) positionOnAnnotation(a annotJump) {
 	m.nav.onAnnotationRow = false
 	if a.Line == 0 {
 		m.nav.diffCursor = -1
 	} else {
-		idx := m.findDiffLineIndex(a.Line, a.Type)
+		idx := m.resolveJumpIndex(a)
 		if idx >= 0 {
 			m.nav.diffCursor = idx
 			m.ensureHunkExpanded(idx)

@@ -37,6 +37,11 @@ type Client interface {
 	Submit(ctx context.Context, pr PullRequest, event Event, annots []annot.Annotation) (Submission, error)
 	Comments(ctx context.Context, pr PullRequest) ([]LineComment, error)
 	ListOpen(ctx context.Context) ([]Summary, error)
+	// Since resolves what an incremental review starts from and makes the
+	// commit readable in the clone. rev is a revision, or empty to ask the
+	// service for the commit the current user last reviewed. A zero Baseline
+	// with a nil error means there is no such review.
+	Since(ctx context.Context, pr PullRequest, rev string) (Baseline, error)
 	// Kind names the service.
 	Kind() Kind
 	// Verdicts lists the events the service accepts, the quit menu offers them.
@@ -101,6 +106,60 @@ func (pr PullRequest) ScopeKind() string {
 		return "mr"
 	}
 	return "pr"
+}
+
+// Baseline is what an incremental review starts from and how it sits under the
+// head, which decides how much of the range is the author's own work.
+type Baseline struct {
+	Commit    string // full hash, empty when there is no earlier review to start from
+	Rewritten bool   // the head does not descend from Commit, the branch was rewritten
+	Merged    bool   // the base branch was merged in since Commit
+}
+
+// baselineFor resolves rev to a commit the clone can read and reports how it
+// sits under the request head.
+func baselineFor(ctx context.Context, run Runner, dir string, pr PullRequest, rev string) (Baseline, error) {
+	sha, err := resolveCommit(ctx, run, dir, pr.Remote, rev)
+	if err != nil {
+		return Baseline{}, err
+	}
+	b := Baseline{Commit: sha}
+	if _, aerr := run(ctx, dir, "git", "", "merge-base", "--is-ancestor", sha, pr.HeadSHA); aerr != nil {
+		b.Rewritten = true
+	}
+	if pr.Remote != "" && pr.BaseRef != "" && pr.MergeBase != "" {
+		if out, berr := run(ctx, dir, "git", "", "merge-base", pr.Remote+"/"+pr.BaseRef, sha); berr == nil {
+			b.Merged = strings.TrimSpace(out) != pr.MergeBase
+		}
+	}
+	return b, nil
+}
+
+// resolveCommit turns rev into the full hash of a commit this clone can read.
+// A commit no ref reaches, an older review after a force push, is fetched from
+// the remote by object name, which the server only serves for a full hash.
+func resolveCommit(ctx context.Context, run Runner, dir, remote, rev string) (string, error) {
+	if sha, ok := localCommit(ctx, run, dir, rev); ok {
+		return sha, nil
+	}
+	if remote != "" && isFullHash(rev) {
+		// no refspec, so nothing lands under refs/ and the ref list stays clean
+		_, _ = run(ctx, dir, "git", "", "fetch", "--no-tags", remote, rev)
+		if sha, ok := localCommit(ctx, run, dir, rev); ok {
+			return sha, nil
+		}
+	}
+	return "", fmt.Errorf("cannot read commit %s in this clone", rev)
+}
+
+// localCommit is rev's full hash when the clone already has the object.
+func localCommit(ctx context.Context, run Runner, dir, rev string) (string, bool) {
+	out, err := run(ctx, dir, "git", "", "rev-parse", "--verify", "--quiet", rev+"^{commit}")
+	if err != nil {
+		return "", false
+	}
+	sha := strings.TrimSpace(out)
+	return sha, sha != ""
 }
 
 // Event is a review verdict. GitHub takes all three, GitLab maps them to
@@ -317,7 +376,10 @@ func (dl *diffLines) comment(a annot.Annotation) (Comment, bool) {
 	return c, true
 }
 
-// LineComment is an existing review comment anchored to a diff line.
+// LineComment is an existing review comment. Line is 0 when the service
+// anchors it to the file rather than to a line, or when the line it was
+// written against is gone from the current diff. The Orig fields say where it
+// was written, which is all a reader has left once that happens.
 type LineComment struct {
 	Path      string
 	Line      int    // line on Side, the end of the range for multi-line comments
@@ -325,6 +387,10 @@ type LineComment struct {
 	Side      string // LEFT or RIGHT
 	Author    string
 	Body      string
+	Outdated  bool   // the request moved past the revision the comment was written on
+	OrigPath  string // path it was written against, empty when it is Path
+	OrigLine  int    // line it was written against, 0 when unknown
+	OrigSHA   string // commit it was written against, empty when unknown
 }
 
 // Summary is one entry of the open pull request list.
@@ -344,3 +410,12 @@ func IsNoPullRequest(err error) bool {
 
 // allVerdicts is the full set of events, in menu order.
 var allVerdicts = []Event{EventComment, EventApprove, EventRequestChanges}
+
+// normalizeBody makes comment text safe to draw: the services return CRLF line
+// endings, and a bare carriage return sent to a terminal returns the cursor to
+// the start of the line, which overwrites whatever was drawn there.
+func normalizeBody(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.TrimSpace(s)
+}

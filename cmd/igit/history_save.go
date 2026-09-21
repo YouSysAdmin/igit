@@ -36,7 +36,7 @@ func historyParams(r histReq) session.Params {
 	return session.Params{
 		Annotations:    r.annotations,
 		Path:           histPath,
-		Ref:            r.opts.ref(),
+		Ref:            r.opts.scopeRef(),
 		Staged:         r.opts.Review.Staged,
 		GitRoot:        r.gitRoot,
 		AnnotatedFiles: r.files,

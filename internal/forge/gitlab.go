@@ -441,7 +441,7 @@ func (g *GitLab) Comments(ctx context.Context, pr PullRequest) ([]LineComment, e
 				if n.Type != "DiffNote" || n.System || n.Resolved || n.Position == nil {
 					continue
 				}
-				lc := LineComment{Author: n.Author.Username, Body: strings.TrimSpace(n.Body), Side: "RIGHT", Path: n.Position.NewPath}
+				lc := LineComment{Author: n.Author.Username, Body: normalizeBody(n.Body), Side: "RIGHT", Path: n.Position.NewPath}
 				switch {
 				case n.Position.NewLine != nil && *n.Position.NewLine > 0:
 					lc.Line = *n.Position.NewLine
@@ -486,4 +486,14 @@ func (g *GitLab) ListOpen(ctx context.Context) ([]Summary, error) {
 		list = append(list, Summary{Number: m.IID, Title: strings.TrimSpace(m.Title), Author: m.Author.Username, Branch: m.SourceBranch, Draft: m.Draft})
 	}
 	return list, nil
+}
+
+// Since resolves what an incremental review starts from. The service part is
+// not wired yet: an empty rev would come from merge_requests/:iid/versions, so
+// for now only an explicit revision works.
+func (g *GitLab) Since(ctx context.Context, pr PullRequest, rev string) (Baseline, error) {
+	if rev == "" {
+		return Baseline{}, nil
+	}
+	return baselineFor(ctx, g.run, g.dir, pr, rev)
 }

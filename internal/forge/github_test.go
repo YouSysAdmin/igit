@@ -251,21 +251,31 @@ func TestCommandError(t *testing.T) {
 }
 
 func TestGitHub_Comments(t *testing.T) {
+	const oldSHA = "1111111111111111111111111111111111111111"
 	pages := `[[{"path":"a.go","line":13,"side":"RIGHT","body":" looks off ","user":{"login":"alice"}},
-	{"path":"a.go","line":null,"original_line":3,"side":"RIGHT","body":"outdated","user":{"login":"bob"}},
+	{"path":"a.go","line":null,"original_line":3,"original_commit_id":"` + oldSHA + `","side":"RIGHT","body":"outdated","user":{"login":"bob"}},
 	{"path":"b.go","line":20,"start_line":18,"side":"LEFT","body":"range","user":{"login":"carol"}},
 	{"path":"c.go","line":4,"body":"no side","user":{"login":"dan"}}],
-	[{"path":"d.go","line":1,"side":"RIGHT","body":"page two","user":{"login":"eve"}}]]`
-	f := &fakeRunner{answers: map[string]string{"gh api --paginate --slurp": pages}}
+	[{"path":"d.go","line":1,"side":"RIGHT","body":"page two","user":{"login":"eve"}},
+	{"path":"e.go","line":null,"subject_type":"file","side":"RIGHT","body":"whole file","user":{"login":"frank"}}]]`
+	// old line 3 of a.go survived as new line 5
+	diff := "--- a/a.go\n+++ b/a.go\n@@ -1,3 +1,5 @@\n+one\n+two\n ctx1\n ctx2\n keep\n"
+	f := &fakeRunner{answers: map[string]string{
+		"gh api --paginate --slurp": pages,
+		"git cat-file -e":           "",
+		"git diff":                  diff,
+	}}
 	g := NewWithRunner("/repo", f.run)
-	got, err := g.Comments(t.Context(), PullRequest{Owner: "o", Repo: "r", Number: 3})
+	got, err := g.Comments(t.Context(), PullRequest{Owner: "o", Repo: "r", Number: 3, HeadSHA: "head"})
 	require.NoError(t, err)
 	assert.Equal(t, []LineComment{
 		{Path: "a.go", Line: 13, Side: "RIGHT", Author: "alice", Body: "looks off"},
+		{Path: "a.go", Line: 5, Side: "RIGHT", Author: "bob", Body: "outdated", Outdated: true, OrigLine: 3, OrigSHA: oldSHA},
 		{Path: "b.go", Line: 20, StartLine: 18, Side: "LEFT", Author: "carol", Body: "range"},
 		{Path: "c.go", Line: 4, Side: "RIGHT", Author: "dan", Body: "no side"},
 		{Path: "d.go", Line: 1, Side: "RIGHT", Author: "eve", Body: "page two"},
-	}, got, "outdated comments are dropped, every page is read, a missing side means RIGHT")
+		{Path: "e.go", Side: "RIGHT", Author: "frank", Body: "whole file"},
+	}, got, "an outdated comment is re-anchored, a file comment keeps no line, every page is read, a missing side means RIGHT")
 	assert.Contains(t, strings.Join(f.calls[0].args, " "), "repos/o/r/pulls/3/comments")
 
 	empty := &fakeRunner{answers: map[string]string{"gh api": ""}}
@@ -290,4 +300,70 @@ func TestIsNoPullRequest(t *testing.T) {
 	assert.True(t, IsNoPullRequest(errors.New("gh pr view: no pull requests found for branch \"main\"")))
 	assert.False(t, IsNoPullRequest(errors.New("HTTP 401")))
 	assert.False(t, IsNoPullRequest(nil))
+}
+
+func TestGitHub_Since(t *testing.T) {
+	const (
+		mine   = "1111111111111111111111111111111111111111"
+		theirs = "2222222222222222222222222222222222222222"
+	)
+	pr := PullRequest{Owner: "o", Repo: "r", Number: 3, HeadSHA: "head", Remote: "origin"}
+	user := `{"login":"alice"}`
+
+	t.Run("the newest submitted review of this user wins", func(t *testing.T) {
+		reviews := `[[{"id":1,"state":"COMMENTED","commit_id":"` + theirs + `","submitted_at":"2026-01-03T00:00:00Z","user":{"login":"bob"}},
+		{"id":2,"state":"APPROVED","commit_id":"old","submitted_at":"2026-01-01T00:00:00Z","user":{"login":"alice"}},
+		{"id":3,"state":"COMMENTED","commit_id":"` + mine + `","submitted_at":"2026-01-02T00:00:00Z","user":{"login":"alice"}},
+		{"id":4,"state":"PENDING","commit_id":"draft","submitted_at":"2026-01-09T00:00:00Z","user":{"login":"alice"}}]]`
+		f := &fakeRunner{answers: map[string]string{
+			"gh api user":               user,
+			"gh api --paginate --slurp": reviews,
+			"git rev-parse":             mine,
+			"git merge-base":            "",
+		}}
+		g := NewWithRunner("/repo", f.run)
+		b, err := g.Since(t.Context(), pr, "")
+		require.NoError(t, err)
+		assert.Equal(t, mine, b.Commit, "another user's review and this user's draft are both skipped")
+	})
+
+	t.Run("no review of this user is not an error", func(t *testing.T) {
+		f := &fakeRunner{answers: map[string]string{
+			"gh api user":               user,
+			"gh api --paginate --slurp": `[[{"id":1,"state":"COMMENTED","commit_id":"x","submitted_at":"2026-01-01T00:00:00Z","user":{"login":"bob"}}]]`,
+		}}
+		g := NewWithRunner("/repo", f.run)
+		b, err := g.Since(t.Context(), pr, "")
+		require.NoError(t, err)
+		assert.Empty(t, b.Commit, "the caller falls back to the full request diff")
+	})
+
+	t.Run("an explicit revision never asks who the user is", func(t *testing.T) {
+		f := &fakeRunner{answers: map[string]string{"git rev-parse": mine, "git merge-base": ""}}
+		g := NewWithRunner("/repo", f.run)
+		b, err := g.Since(t.Context(), pr, "HEAD~3")
+		require.NoError(t, err)
+		assert.Equal(t, mine, b.Commit)
+		for _, c := range f.calls {
+			assert.NotEqual(t, "gh", c.name, "no API call is needed for a revision the user named")
+		}
+	})
+
+	t.Run("a rewritten branch is reported", func(t *testing.T) {
+		f := &fakeRunner{
+			answers: map[string]string{"git rev-parse": mine},
+			fail:    map[string]string{"git merge-base --is-ancestor": "not an ancestor"},
+		}
+		g := NewWithRunner("/repo", f.run)
+		b, err := g.Since(t.Context(), pr, mine)
+		require.NoError(t, err)
+		assert.True(t, b.Rewritten)
+	})
+
+	t.Run("an unreadable revision is an error", func(t *testing.T) {
+		f := &fakeRunner{fail: map[string]string{"git rev-parse": "unknown revision", "git fetch": "refused"}}
+		g := NewWithRunner("/repo", f.run)
+		_, err := g.Since(t.Context(), pr, mine)
+		require.ErrorContains(t, err, "cannot read commit")
+	})
 }

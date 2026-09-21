@@ -3,7 +3,6 @@ package tui
 import (
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/yousysadmin/igit/internal/annot"
 	"github.com/yousysadmin/igit/internal/git"
 	"github.com/yousysadmin/igit/internal/tui/overlay"
 )
@@ -29,6 +28,7 @@ func (m Model) handleAnnotNav(forward bool) (tea.Model, tea.Cmd) {
 			File:       target.File,
 			ChangeType: target.Type,
 			Line:       target.Line,
+			Side:       target.side,
 		})
 		if jumped {
 			return nextModel, cmd
@@ -57,7 +57,7 @@ type cursorAnnotKey struct {
 func (m Model) currentAnnotKey() cursorAnnotKey {
 	file := m.file.name
 	if m.nav.diffCursor == -1 {
-		return cursorAnnotKey{file: file, line: 0, typ: "", onAnnot: m.hasFileAnnotation()}
+		return cursorAnnotKey{file: file, line: 0, typ: "", onAnnot: m.hasFileRow()}
 	}
 	if m.nav.diffCursor < 0 || m.nav.diffCursor >= len(m.file.lines) {
 		return cursorAnnotKey{file: file, line: -1, typ: "", onAnnot: false}
@@ -94,7 +94,7 @@ func (m Model) dividerAnnotKey(file string) cursorAnnotKey {
 // or one past an exact-match index. Backward: mirror. Returns an
 // out-of-range index (-1 or len(flat)) when the cursor is at the
 // corresponding boundary - the loop exits immediately in that case.
-func startingFlatIndex(flat []annot.Annotation, cur cursorAnnotKey, forward bool) int {
+func startingFlatIndex(flat []annotListItem, cur cursorAnnotKey, forward bool) int {
 	if idx, ok := exactAnnotIndex(flat, cur); ok {
 		if forward {
 			return idx + 1
@@ -112,7 +112,7 @@ func startingFlatIndex(flat []annot.Annotation, cur cursorAnnotKey, forward bool
 // matches the cursor (file, line, type). When cur.onAnnot is false it
 // short-circuits without scanning. ok=false means "use insertion-point
 // fallback instead."
-func exactAnnotIndex(flat []annot.Annotation, cur cursorAnnotKey) (int, bool) {
+func exactAnnotIndex(flat []annotListItem, cur cursorAnnotKey) (int, bool) {
 	if !cur.onAnnot {
 		return 0, false
 	}
@@ -128,7 +128,7 @@ func exactAnnotIndex(flat []annot.Annotation, cur cursorAnnotKey) (int, bool) {
 // in the flat list under (file, line) ordering - i.e. the index of the
 // first annotation strictly after the cursor, or len(flat) if all entries
 // are at or before the cursor.
-func annotInsertionPoint(flat []annot.Annotation, cur cursorAnnotKey) int {
+func annotInsertionPoint(flat []annotListItem, cur cursorAnnotKey) int {
 	for i, a := range flat {
 		if compareAnnotPos(a.File, a.Line, cur.file, cur.line) > 0 {
 			return i

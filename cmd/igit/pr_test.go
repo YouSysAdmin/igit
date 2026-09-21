@@ -145,7 +145,7 @@ func TestPrepareWithHub_loadsComments(t *testing.T) {
 		"gh api --paginate --slurp": `[[{"path":"a.go","line":3,"side":"RIGHT","body":"hi","user":{"login":"al"}}]]`,
 	}, nil, &calls)
 	var warn strings.Builder
-	sess, err := prepareWithHub(t.Context(), hub, "12", nil, &warn)
+	sess, err := prepareWithHub(t.Context(), hub, "/repo", prRequest{ref: "12", warn: &warn})
 	require.NoError(t, err)
 	assert.Equal(t, "mb", sess.pr.MergeBase)
 	assert.Equal(t, []tui.RemoteNote{{File: "a.go", Line: 3, Side: "RIGHT", Author: "al", Body: "hi"}}, sess.notes)
@@ -153,7 +153,7 @@ func TestPrepareWithHub_loadsComments(t *testing.T) {
 
 	// a failing comment fetch is a warning, not an error
 	hub = fakeHub(map[string]string{"gh pr view": prViewJSON, "git merge-base": "mb\n"}, map[string]string{"gh api": "HTTP 500"}, nil)
-	sess, err = prepareWithHub(t.Context(), hub, "12", nil, &warn)
+	sess, err = prepareWithHub(t.Context(), hub, "/repo", prRequest{ref: "12", warn: &warn})
 	require.NoError(t, err)
 	assert.Empty(t, sess.notes)
 	assert.Contains(t, warn.String(), "warning: existing review comments not loaded")
@@ -178,7 +178,7 @@ func TestPrepareWithHub_picksWhenBranchHasNoPR(t *testing.T) {
 	})
 	var offered []tui.PickItem
 	pick := func(items []tui.PickItem) (string, error) { offered = items; return "7", nil }
-	sess, err := prepareWithHub(t.Context(), hub, "", pick, nil)
+	sess, err := prepareWithHub(t.Context(), hub, "/repo", prRequest{ref: "", pick: pick})
 	require.NoError(t, err)
 	assert.Equal(t, 7, sess.pr.Number)
 	require.Len(t, offered, 2)
@@ -187,18 +187,18 @@ func TestPrepareWithHub_picksWhenBranchHasNoPR(t *testing.T) {
 
 	// canceling the picker is an error the caller reports
 	cancel := func([]tui.PickItem) (string, error) { return "", nil }
-	_, err = prepareWithHub(t.Context(), hub, "", cancel, nil)
+	_, err = prepareWithHub(t.Context(), hub, "/repo", prRequest{ref: "", pick: cancel})
 	require.ErrorContains(t, err, "no pull request chosen")
 
 	// an explicit ref that fails is never turned into a picker
-	_, err = prepareWithHub(t.Context(), hub, "nope", pick, nil)
+	_, err = prepareWithHub(t.Context(), hub, "/repo", prRequest{ref: "nope", pick: pick})
 	require.ErrorContains(t, err, "pull request")
 	assert.Equal(t, 2, views, "each no-ref flow looks the branch up once")
 }
 
 func TestPrepareWithHub_noOpenRequestsKeepsOriginalError(t *testing.T) {
 	hub := fakeHub(map[string]string{"gh pr list": "[]"}, map[string]string{"gh pr view": "no pull requests found for branch \"main\""}, nil)
-	_, err := prepareWithHub(t.Context(), hub, "", func([]tui.PickItem) (string, error) { return "1", nil }, nil)
+	_, err := prepareWithHub(t.Context(), hub, "/repo", prRequest{pick: func([]tui.PickItem) (string, error) { return "1", nil }})
 	require.ErrorContains(t, err, "no pull requests found")
 }
 
@@ -206,4 +206,67 @@ func TestShortSHA(t *testing.T) {
 	assert.Equal(t, "0123456", shortSHA("0123456789abcdef0123456789abcdef01234567"))
 	assert.Equal(t, "abc", shortSHA("abc"))
 	assert.Empty(t, shortSHA(""))
+}
+
+func TestValidatePRFlags_since(t *testing.T) {
+	var opts options
+	opts.Review.Since = "review"
+	require.ErrorContains(t, validatePRFlags(opts), "--since is only valid with igit pr")
+
+	opts.prSubcommand = true
+	require.NoError(t, validatePRFlags(opts))
+}
+
+func TestOptions_scopeRef(t *testing.T) {
+	var opts options
+	opts.Refs.Base, opts.Refs.Against = "mid", "head"
+	assert.Equal(t, "mid..head", opts.scopeRef(), "without a request the displayed range is the scope")
+
+	opts.prFullRef = "base..head"
+	assert.Equal(t, "base..head", opts.scopeRef(), "a request anchors annotations against its own diff")
+}
+
+func TestResolveBaseline(t *testing.T) {
+	const mine = "1111111111111111111111111111111111111111"
+	pr := forge.PullRequest{Owner: "o", Repo: "r", Number: 9, HeadSHA: "head", Remote: "origin", Forge: forge.KindGitHub}
+	reviews := `[[{"id":3,"state":"COMMENTED","commit_id":"` + mine + `","submitted_at":"2026-01-02T00:00:00Z","user":{"login":"alice"}}]]`
+
+	t.Run("the reserved word asks the service", func(t *testing.T) {
+		hub := fakeHub(map[string]string{
+			"gh api user":               `{"login":"alice"}`,
+			"gh api --paginate --slurp": reviews,
+			"git rev-parse":             mine,
+		}, nil, nil)
+		var warn strings.Builder
+		got, err := resolveBaseline(t.Context(), hub, pr, prRequest{since: sinceReview, warn: &warn}, "/repo")
+		require.NoError(t, err)
+		assert.Equal(t, mine, got)
+	})
+
+	t.Run("no review falls back to the full diff with a warning", func(t *testing.T) {
+		hub := fakeHub(map[string]string{
+			"gh api user":               `{"login":"alice"}`,
+			"gh api --paginate --slurp": `[[]]`,
+		}, nil, nil)
+		var warn strings.Builder
+		got, err := resolveBaseline(t.Context(), hub, pr, prRequest{since: sinceReview, warn: &warn}, "/repo")
+		require.NoError(t, err)
+		assert.Empty(t, got)
+		assert.Contains(t, warn.String(), "no submitted review of PR #9 found")
+	})
+
+	t.Run("a revision the user named must resolve", func(t *testing.T) {
+		hub := fakeHub(nil, map[string]string{"git rev-parse": "unknown revision", "git fetch": "refused"}, nil)
+		_, err := resolveBaseline(t.Context(), hub, pr, prRequest{since: "bogus"}, "/repo")
+		require.ErrorContains(t, err, "--since bogus")
+	})
+
+	t.Run("a request that has not moved says so", func(t *testing.T) {
+		hub := fakeHub(map[string]string{"git rev-parse": "head"}, nil, nil)
+		var warn strings.Builder
+		got, err := resolveBaseline(t.Context(), hub, pr, prRequest{since: "head", warn: &warn}, "/repo")
+		require.NoError(t, err)
+		assert.Equal(t, "head", got)
+		assert.Contains(t, warn.String(), "has not changed since")
+	})
 }

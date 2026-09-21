@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ type options struct {
 	commitSubcommand bool   // true when "igit commit" was invoked
 	prSubcommand     bool   // true when "igit pr [ref]" was invoked
 	prRef            string // what gh resolves for igit pr: number, URL or branch, empty = current branch
+	prFullRef        string // full request range of a request review, the annotation scope
 	updateSubcommand bool   // true when "igit update" was invoked
 
 	Mode           string   `long:"mode" ini-name:"mode" env:"IGIT_MODE" choice:"review" choice:"commit" default:"review" description:"start in review or commit mode"`
@@ -102,6 +104,7 @@ type reviewOptions struct {
 	Only             []string `long:"only" short:"F" no-ini:"true" description:"show only these files (may be repeated)"`
 	Annotations      string   `long:"annotations" no-ini:"true" description:"preload annotations from a markdown file written by -o (round-trip)"`
 	Resume           bool     `long:"resume" no-ini:"true" description:"continue the last saved review of this repository from the history, with a picker when several match"`
+	Since            string   `long:"since" no-ini:"true" description:"with igit pr: review only what changed since this revision, or since your own last submitted review with --since=review (use refs/heads/review for a branch of that name)"`
 	Collapsed        bool     `long:"collapsed" ini-name:"collapsed" env:"IGIT_COLLAPSED" description:"start in collapsed diff mode"`
 	Compact          bool     `long:"compact" ini-name:"compact" env:"IGIT_COMPACT" description:"start in compact diff mode (small context around changes)"`
 	CompactContext   int      `long:"compact-context" ini-name:"compact-context" env:"IGIT_COMPACT_CONTEXT" default:"5" description:"number of context lines around changes when in compact mode"`
@@ -129,6 +132,14 @@ func (o options) ref() string {
 		return o.Refs.Base + ".." + o.Refs.Against
 	}
 	return o.Refs.Base
+}
+
+// scopeRef is the range annotations are anchored and saved against. It is
+// ref() everywhere except an incremental request review, where the displayed
+// range is narrower than the request's own diff and would otherwise drop every
+// annotation outside it.
+func (o options) scopeRef() string {
+	return cmp.Or(o.prFullRef, o.ref())
 }
 
 // startupUntracked reports whether untracked files are part of the review.

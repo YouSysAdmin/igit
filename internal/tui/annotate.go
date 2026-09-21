@@ -452,9 +452,19 @@ func (m Model) hasFileAnnotation() bool {
 	return false
 }
 
+// hasFileRow reports whether the file block occupies rows: a file-level
+// annotation, remote comments that belong to the file, or both. Layout and
+// navigation ask this, the store-mutating paths keep asking hasFileAnnotation.
+func (m Model) hasFileRow() bool {
+	if m.hasFileAnnotation() {
+		return true
+	}
+	return !m.host.annotationsHidden && len(m.remoteByKey[annotKeyFile]) > 0
+}
+
 // cursorOnFileAnnotationLine returns true if the diff cursor is on the file-level annotation line.
 func (m Model) cursorOnFileAnnotationLine() bool {
-	return m.nav.diffCursor == -1 && m.hasFileAnnotation()
+	return m.nav.diffCursor == -1 && m.hasFileRow()
 }
 
 // diffLineNum returns the display line number for a diff line.
@@ -571,7 +581,12 @@ func (m *Model) annotationVisualRows(prefix, body string) []string {
 // applyTheme is load-bearing. anyone adding a runtime color toggle that affects
 // AnnotationInline MUST also invalidate the cache.
 func (m Model) composeAnnotationRows(prefix, body string, wrapW int) []string {
-	first := prefix + body
+	// a bare carriage return returns the terminal cursor to the start of the
+	// line and overwrites what was drawn there, so no body reaches the painter
+	// carrying one. CRLF text arrives from request comments and from files
+	// loaded with --annotations
+	first := strings.ReplaceAll(prefix+body, "\r\n", "\n")
+	first = strings.ReplaceAll(first, "\r", "\n")
 	logical := strings.Split(first, "\n")
 	indent := strings.Repeat(" ", lipgloss.Width(prefix))
 
@@ -653,7 +668,7 @@ func (m Model) cursorViewportYUsing(hunks []int, annotationSet map[string]bool) 
 	}
 
 	fileAnnotationOffset := 0
-	if m.hasFileAnnotation() {
+	if m.hasFileRow() {
 		fileAnnotationOffset = m.wrappedAnnotationLineCount(annotKeyFile)
 	}
 
@@ -677,7 +692,7 @@ func (m Model) cursorViewportYUsing(hunks []int, annotationSet map[string]bool) 
 func (m Model) cursorVisualOffsets(hunks []int, annotationSet map[string]bool) []int {
 	offsets := make([]int, len(m.file.lines))
 	y := 0
-	if m.hasFileAnnotation() {
+	if m.hasFileRow() {
 		y = m.wrappedAnnotationLineCount(annotKeyFile)
 	}
 	for i := range m.file.lines {
@@ -751,7 +766,7 @@ func (m Model) rowOnAnnotationSubLine(idx, relRow, h int, hunks []int, annSet ma
 // rather than to the diff line. Rows past the end clamp to the last line.
 func (m Model) visualRowToDiffLine(row int) (idx int, onAnnotation bool) {
 	if len(m.file.lines) == 0 {
-		if m.hasFileAnnotation() && row >= 0 && row < m.wrappedAnnotationLineCount(annotKeyFile) {
+		if m.hasFileRow() && row >= 0 && row < m.wrappedAnnotationLineCount(annotKeyFile) {
 			return -1, false
 		}
 		return m.nav.diffCursor, false
@@ -764,7 +779,7 @@ func (m Model) visualRowToDiffLine(row int) (idx int, onAnnotation bool) {
 	annSet := m.buildAnnotationSet()
 
 	running := 0
-	if m.hasFileAnnotation() {
+	if m.hasFileRow() {
 		fileRows := m.wrappedAnnotationLineCount(annotKeyFile)
 		if row < fileRows {
 			return -1, false

@@ -384,6 +384,7 @@ type ReviewInfoConfig struct {
 	Standalone     bool   // the session reviews files off disk (--only outside a repository), there is no working tree or ref scope
 	WorkDir        string
 	Ref            string
+	Baseline       string // what an incremental request review starts from, empty otherwise
 	Staged         bool
 	Only           []string
 	Include        []string
@@ -539,7 +540,7 @@ type Model struct {
 	discarded        bool // true when user chose to discard annotations and quit
 	inConfirmDiscard bool // true when showing discard confirmation prompt
 
-	pendingAnnotJump *annot.Annotation // pending jump target after cross-file annotation list jump
+	pendingAnnotJump *annotJump // pending jump target after cross-file annotation list jump
 
 	activeThemeName string               // name of currently applied theme (for cursor positioning)
 	themePreview    *themePreviewSession // non-nil while theme selector is open

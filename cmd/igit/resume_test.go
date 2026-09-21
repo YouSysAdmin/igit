@@ -1,14 +1,18 @@
 package main
 
 import (
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/yousysadmin/igit/internal/annot"
+	"github.com/yousysadmin/igit/internal/git"
 	"github.com/yousysadmin/igit/internal/session"
 	"github.com/yousysadmin/igit/internal/tui"
 )
@@ -152,4 +156,72 @@ func gitCmd(t *testing.T, dir string, args ...string) {
 	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "HOME="+dir)
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
+}
+
+// TestScopeRef_keepsAnnotationsOutsideTheNarrowRange is the regression test for
+// an incremental request review: the displayed range is narrower than the
+// request's own diff, and saved annotations outside it must survive. Without
+// scopeRef the preloader drops them and the history save then rewrites the
+// entry with only the survivors.
+func TestScopeRef_keepsAnnotationsOutsideTheNarrowRange(t *testing.T) {
+	dir := t.TempDir()
+	gitCmd(t, dir, "init", "-b", "main")
+	gitCmd(t, dir, "config", "user.email", "t@example.com")
+	gitCmd(t, dir, "config", "user.name", "t")
+
+	write := func(name, body string) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600))
+	}
+	write("a.go", "one\ntwo\n")
+	write("b.go", "one\n")
+	gitCmd(t, dir, "add", ".")
+	gitCmd(t, dir, "commit", "-m", "base")
+	base := revParse(t, dir)
+
+	write("a.go", "one\nchanged\n") // the first review round looked at this
+	gitCmd(t, dir, "commit", "-am", "round one")
+	mid := revParse(t, dir)
+
+	write("b.go", "fixed\n") // everything the author did since
+	gitCmd(t, dir, "commit", "-am", "round two")
+	head := revParse(t, dir)
+
+	rec := []annot.Annotation{{File: "a.go", Line: 2, Type: "+", Comment: "from the first round"}}
+	source := git.NewGit(dir)
+
+	narrow := options{}
+	narrow.Refs.Base, narrow.Refs.Against = mid, head
+	require.Equal(t, mid+".."+head, narrow.ref())
+
+	t.Run("the narrow range alone drops it", func(t *testing.T) {
+		store := annot.NewStore()
+		require.NoError(t, preloadRecords(rec, store, source, narrow.ref(), false, nil, nil, dir, io.Discard))
+		assert.Equal(t, 0, store.Count(), "a.go is not in the range the author changed since the review")
+	})
+
+	t.Run("scopeRef keeps it", func(t *testing.T) {
+		wide := narrow
+		wide.prFullRef = base + ".." + head
+		store := annot.NewStore()
+		require.NoError(t, preloadRecords(rec, store, source, wide.scopeRef(), false, nil, nil, dir, io.Discard))
+		assert.Equal(t, 1, store.Count(), "the request's own diff is the annotation scope, not the viewport")
+	})
+
+	t.Run("the history records the request range, not the viewport", func(t *testing.T) {
+		wide := narrow
+		wide.prFullRef = base + ".." + head
+		p := historyParams(histReq{opts: wide, gitRoot: dir, workDir: dir, pr: 9, prHead: shortSHA(head), annotations: "x"})
+		assert.Equal(t, base+".."+head, p.Ref)
+	})
+}
+
+// revParse is the current HEAD of the test repository.
+func revParse(t *testing.T, dir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "HOME="+dir)
+	out, err := cmd.Output()
+	require.NoError(t, err)
+	return strings.TrimSpace(string(out))
 }

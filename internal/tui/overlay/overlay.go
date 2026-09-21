@@ -116,6 +116,7 @@ type AnnotationTarget struct {
 	File       string
 	ChangeType string
 	Line       int
+	Side       string // LEFT or RIGHT for a request comment, empty for a session annotation
 }
 
 // ThemeSelectSpec describes the theme selector popup content.

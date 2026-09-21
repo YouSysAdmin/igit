@@ -19,11 +19,15 @@ import (
 // directly inside handleAnnotNav for O(N) navigation. this wrapper keeps
 // the table-driven picking-algorithm tests intact as algorithm documentation.
 func pickAdjacentAnnotation(flat []annot.Annotation, cur cursorAnnotKey, forward bool) (annot.Annotation, bool) {
-	idx := startingFlatIndex(flat, cur, forward)
-	if idx < 0 || idx >= len(flat) {
+	items := make([]annotListItem, len(flat))
+	for i, a := range flat {
+		items[i] = annotListItem{Annotation: a}
+	}
+	idx := startingFlatIndex(items, cur, forward)
+	if idx < 0 || idx >= len(items) {
 		return annot.Annotation{}, false
 	}
-	return flat[idx], true
+	return items[idx].Annotation, true
 }
 
 func TestPickAdjacentAnnotation(t *testing.T) {

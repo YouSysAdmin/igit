@@ -113,7 +113,7 @@ type savedAnnotationsReq struct {
 // that entry on exit.
 func loadSavedAnnotations(opts options, r savedAnnotationsReq) (restored bool, err error) {
 	if opts.Review.Annotations != "" {
-		return false, preloadAnnotations(opts.Review.Annotations, r.store, r.source, opts.ref(), opts.Review.Staged, r.untrackedFn, r.untrackedRenamesFn, r.workDir, os.Stderr)
+		return false, preloadAnnotations(opts.Review.Annotations, r.store, r.source, opts.scopeRef(), opts.Review.Staged, r.untrackedFn, r.untrackedRenamesFn, r.workDir, os.Stderr)
 	}
 	if !opts.Review.Resume && r.pr == 0 {
 		return false, nil
@@ -123,7 +123,7 @@ func loadSavedAnnotations(opts options, r savedAnnotationsReq) (restored bool, e
 	if err != nil || !found {
 		return false, err
 	}
-	return true, preloadRecords(entry.Records, r.store, r.source, opts.ref(), opts.Review.Staged, r.untrackedFn, r.untrackedRenamesFn, r.workDir, os.Stderr)
+	return true, preloadRecords(entry.Records, r.store, r.source, opts.scopeRef(), opts.Review.Staged, r.untrackedFn, r.untrackedRenamesFn, r.workDir, os.Stderr)
 }
 
 // terminalPicker returns a pickFunc factory: each call runs tui.PickList as

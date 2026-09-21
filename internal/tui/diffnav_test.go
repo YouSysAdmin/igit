@@ -2727,7 +2727,7 @@ func TestModel_PendingHunkJump_ClearedWhenPendingAnnotJumpLands(t *testing.T) {
 
 	fwd := true
 	m.nav.pendingHunkJump = &fwd
-	m.pendingAnnotJump = &annot.Annotation{File: "b.go", Line: 1, Type: "+", Comment: "note"}
+	m.pendingAnnotJump = &annotJump{Annotation: annot.Annotation{File: "b.go", Line: 1, Type: "+", Comment: "note"}}
 	m.file.loadSeq++
 	loadMsg := fileLoadedMsg{file: "b.go", seq: m.file.loadSeq, lines: diffs["b.go"]}
 	result, _ = m.Update(loadMsg)

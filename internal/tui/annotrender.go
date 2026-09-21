@@ -24,15 +24,22 @@ func (m Model) renderFileAnnotationHeader(b *strings.Builder, dec decorations) {
 
 	// gate on hasFile, not on a non-empty body: an empty-body file-level
 	// annotation loaded via --annotations still reserves a viewport row via
-	// hasFileAnnotation+wrappedAnnotationLineCount, and the chokepoint emits a
+	// hasFileRow+wrappedAnnotationLineCount, and the chokepoint emits a
 	// single prefix-only row when body is empty. gating on the body would skip
 	// paint while the height query still reserves the row.
-	if dec.hasFile {
-		cursor := " "
-		if m.nav.diffCursor == -1 && m.layout.focus == paneDiff {
-			cursor = m.renderer.DiffCursor(m.cfg.noColors)
-		}
-		m.renderWrappedAnnotation(b, cursor, m.annotFilePrefix(), dec.fileComment)
+	remotes := dec.remotes[annotKeyFile]
+	if !dec.hasFile && len(remotes) == 0 {
+		return
+	}
+	cursor := " "
+	if m.nav.diffCursor == -1 && m.layout.focus == paneDiff {
+		cursor = m.renderer.DiffCursor(m.cfg.noColors)
+	}
+	// same shape as renderAnnotationOrInput, so the file and line blocks paint
+	// the same set the height query counts
+	for _, seg := range m.annotationSegments(dec.hasFile, m.annotFilePrefix(), dec.fileComment, remotes) {
+		m.renderWrappedAnnotation(b, cursor, seg.prefix, seg.body)
+		cursor = " " // only the first row of the block carries the cursor
 	}
 }
 

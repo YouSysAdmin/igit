@@ -12,6 +12,7 @@ import (
 	"github.com/yousysadmin/igit/internal/annot"
 	"github.com/yousysadmin/igit/internal/forge"
 	"github.com/yousysadmin/igit/internal/git"
+	"github.com/yousysadmin/igit/internal/session"
 	"github.com/yousysadmin/igit/internal/tui"
 )
 
@@ -39,9 +40,12 @@ func detectPRSubcommand(opts options, args []string) options {
 }
 
 // validatePRFlags rejects review sources that make no sense for a pull
-// request, which always compares the merge base with the head commit.
+// request, and request-only flags outside one.
 func validatePRFlags(opts options) error {
 	if !opts.prSubcommand {
+		if opts.Review.Since != "" {
+			return errors.New("--since is only valid with igit pr")
+		}
 		return nil
 	}
 	if opts.Review.Staged {
@@ -50,12 +54,19 @@ func validatePRFlags(opts options) error {
 	return nil
 }
 
+// sinceReview is the reserved --since value that asks the service for the
+// commit the current user last reviewed. A branch of that name is reachable as
+// refs/heads/review.
+const sinceReview = "review"
+
 // prSession is a resolved request, the client that posts the review and the
 // comments the request already carries.
 type prSession struct {
-	pr    forge.PullRequest
-	hub   forge.Client
-	notes []tui.RemoteNote
+	pr       forge.PullRequest
+	hub      forge.Client
+	notes    []tui.RemoteNote
+	root     string // the clone the request was resolved in
+	baseline string // what an incremental review starts from, empty for the full diff
 }
 
 // pickFunc lets the user choose one of the open pull requests. it returns the
@@ -69,7 +80,7 @@ type pickFunc func(items []tui.PickItem) (string, error)
 // request for the checked-out branch, the open requests are offered through
 // the picker pickFor builds. Existing review comments are loaded too. a
 // failure there is only a warning on warn.
-func preparePullRequest(ctx context.Context, ref string, override forge.Kind, pickFor func(title string) pickFunc, warn io.Writer) (prSession, error) {
+func preparePullRequest(ctx context.Context, r prRequest) (prSession, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return prSession{}, fmt.Errorf("current directory: %w", err)
@@ -78,7 +89,7 @@ func preparePullRequest(ctx context.Context, ref string, override forge.Kind, pi
 	if !ok {
 		return prSession{}, errors.New("igit pr must run inside a clone of the repository the request belongs to")
 	}
-	hub, err := forge.Open(ctx, root, override)
+	hub, err := forge.Open(ctx, root, r.forge)
 	if err != nil {
 		return prSession{}, fmt.Errorf("pick the code host: %w", err)
 	}
@@ -86,36 +97,130 @@ func preparePullRequest(ctx context.Context, ref string, override forge.Kind, pi
 	if aerr := hub.Available(); aerr != nil {
 		return prSession{}, fmt.Errorf("%s: %w", noun, aerr)
 	}
-	var pick pickFunc
-	if pickFor != nil {
-		pick = pickFor("Open " + noun + "s")
+	if r.pickFor != nil {
+		r.pick = r.pickFor("Open " + noun + "s")
 	}
-	return prepareWithHub(ctx, hub, ref, pick, warn)
+	return prepareWithHub(ctx, hub, root, r)
+}
+
+// prRequest is what a pull-request session needs from the composition root.
+type prRequest struct {
+	ref     string     // what gh or glab resolves: number, URL or branch
+	forge   forge.Kind // the --forge override
+	since   string     // the --since value, empty for the full request diff
+	opts    options    // history settings, for the --since=review fallback
+	pickFor func(title string) pickFunc
+	pick    pickFunc // resolved from pickFor, or set directly by tests
+	warn    io.Writer
 }
 
 // prepareWithHub is preparePullRequest after the client exists. tests call it
 // with a fake runner.
-func prepareWithHub(ctx context.Context, hub forge.Client, ref string, pick pickFunc, warn io.Writer) (prSession, error) {
+func prepareWithHub(ctx context.Context, hub forge.Client, root string, r prRequest) (prSession, error) {
 	noun := forge.KindNoun(hub.Kind())
-	pr, err := hub.Resolve(ctx, ref)
+	pr, err := hub.Resolve(ctx, r.ref)
 	if err != nil {
-		if ref != "" || pick == nil || !hub.IsNoRequest(err) {
+		if r.ref != "" || r.pick == nil || !hub.IsNoRequest(err) {
 			return prSession{}, fmt.Errorf("%s: %w", noun, err)
 		}
-		if pr, err = pickPullRequest(ctx, hub, pick, err); err != nil {
+		if pr, err = pickPullRequest(ctx, hub, r.pick, err); err != nil {
 			return prSession{}, err
 		}
 	}
 	if perr := hub.Prepare(ctx, &pr); perr != nil {
 		return prSession{}, fmt.Errorf("%s: %w", noun, perr)
 	}
-	sess := prSession{pr: pr, hub: hub}
+	sess := prSession{pr: pr, hub: hub, root: root}
+	if r.since != "" {
+		// resolved before the program starts: a range git cannot read would
+		// otherwise surface as a load error painted into the diff pane
+		if sess.baseline, err = resolveBaseline(ctx, hub, pr, r, root); err != nil {
+			return prSession{}, err
+		}
+	}
 	comments, cerr := hub.Comments(ctx, pr)
-	if cerr != nil && warn != nil {
-		_, _ = fmt.Fprintf(warn, "warning: existing review comments not loaded: %v\n", cerr)
+	if cerr != nil && r.warn != nil {
+		_, _ = fmt.Fprintf(r.warn, "warning: existing review comments not loaded: %v\n", cerr)
 	}
 	sess.notes = remoteNotes(comments)
 	return sess, nil
+}
+
+// resolveBaseline picks what an incremental review starts from. The reserved
+// word asks the service and falls back to the commit igit recorded for its own
+// last review of the request. An empty result leaves the full request diff in
+// place, with the reason on warn. A revision the user named explicitly is an
+// error when it does not resolve, because they asked for that one.
+func resolveBaseline(ctx context.Context, hub forge.Client, pr forge.PullRequest, r prRequest, root string) (string, error) {
+	if r.since != sinceReview {
+		b, err := hub.Since(ctx, pr, r.since)
+		if err != nil {
+			return "", fmt.Errorf("--since %s: %w", r.since, err)
+		}
+		return describeBaseline(b, pr, r.warn), nil
+	}
+	b, err := hub.Since(ctx, pr, "")
+	if err != nil {
+		return "", fmt.Errorf("--since=review: %w", err)
+	}
+	if b.Commit == "" {
+		if hist := historyCommitFor(r.opts, root, pr); hist != "" {
+			// best effort: the history keeps a short hash, which cannot be
+			// fetched by object name and can be ambiguous in a large repo
+			if hb, herr := hub.Since(ctx, pr, hist); herr == nil {
+				b = hb
+			}
+		}
+	}
+	if b.Commit == "" {
+		warnf(r.warn, "no submitted review of %s found, showing the full request diff", pr.Name())
+		return "", nil
+	}
+	return describeBaseline(b, pr, r.warn), nil
+}
+
+// describeBaseline warns about the range shapes that carry more than the
+// author's own work, and about a request that has not moved at all.
+func describeBaseline(b forge.Baseline, pr forge.PullRequest, warn io.Writer) string {
+	switch {
+	case b.Commit == "":
+		return ""
+	case b.Commit == pr.HeadSHA:
+		warnf(warn, "the %s has not changed since %s", pr.Noun(), shortSHA(b.Commit))
+	case b.Rewritten:
+		warnf(warn, "the branch was rewritten since %s, the range also carries what the rewrite brought in", shortSHA(b.Commit))
+	case b.Merged:
+		warnf(warn, "the base branch was merged in since %s, the range also carries that", shortSHA(b.Commit))
+	}
+	return b.Commit
+}
+
+// historyCommitFor is the head igit recorded for its last review of the
+// request, empty when the history has no entry for it.
+func historyCommitFor(opts options, gitRoot string, pr forge.PullRequest) string {
+	svc := historyService(opts)
+	if svc == nil || gitRoot == "" {
+		return ""
+	}
+	params := session.Params{Path: gitRoot, GitRoot: gitRoot, PR: pr.Number, PRKind: pr.ScopeKind()}
+	entries, err := svc.List(params)
+	if err != nil {
+		return ""
+	}
+	scope := session.ScopeName(params)
+	for _, e := range entries {
+		if e.Scope == scope {
+			return e.Commit
+		}
+	}
+	return ""
+}
+
+func warnf(w io.Writer, format string, args ...any) {
+	if w == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(w, "warning: "+format+"\n", args...)
 }
 
 // pickPullRequest offers the open requests when the branch has none. noPR is
@@ -157,11 +262,15 @@ func pickPullRequest(ctx context.Context, hub forge.Client, pick pickFunc, noPR 
 
 // remoteNotes converts existing review comments into notes the review model
 // draws under their lines. Multi-line comments are anchored to their last line,
-// where GitHub shows them too.
+// where GitHub shows them too. A comment the request no longer anchors keeps
+// the position it was written against so the model can say where it belonged.
 func remoteNotes(comments []forge.LineComment) []tui.RemoteNote {
 	notes := make([]tui.RemoteNote, 0, len(comments))
 	for _, c := range comments {
-		notes = append(notes, tui.RemoteNote{File: c.Path, Line: c.Line, Side: c.Side, Author: c.Author, Body: c.Body})
+		notes = append(notes, tui.RemoteNote{
+			File: c.Path, Line: c.Line, Side: c.Side, Author: c.Author, Body: c.Body,
+			Outdated: c.Outdated, OrigPath: c.OrigPath, OrigLine: c.OrigLine,
+		})
 	}
 	return notes
 }

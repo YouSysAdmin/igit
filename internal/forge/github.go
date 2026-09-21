@@ -1,6 +1,7 @@
 package forge
 
 import (
+	"cmp"
 	"context"
 	"encoding/json/v2"
 	"errors"
@@ -158,9 +159,11 @@ func (g *GitHub) Submit(ctx context.Context, pr PullRequest, event Event, annots
 	return Submission{URL: url, Event: event, Comments: len(plan.Comments), InBody: len(plan.Outside)}, nil
 }
 
-// Comments returns the pull request's review comments that are still anchored
-// to a line of the current diff. outdated ones (GitHub reports no line) are
-// left out. Every page is fetched.
+// Comments returns the pull request's review comments. Ones GitHub still
+// anchors keep their line. Ones it no longer anchors, because the author
+// changed the code under them, are re-anchored against the current head and
+// marked outdated, so a second review never loses what the first one said.
+// Every page is fetched.
 func (g *GitHub) Comments(ctx context.Context, pr PullRequest) ([]LineComment, error) {
 	endpoint := fmt.Sprintf("repos/%s/%s/pulls/%d/comments", pr.Owner, pr.Repo, pr.Number)
 	out, err := g.run(ctx, g.dir, "gh", "", "api", "--paginate", "--slurp", "-H", "Accept: application/vnd.github+json", endpoint)
@@ -168,12 +171,15 @@ func (g *GitHub) Comments(ctx context.Context, pr PullRequest) ([]LineComment, e
 		return nil, fmt.Errorf("list review comments: %w", err)
 	}
 	var pages [][]struct {
-		Path      string `json:"path"`
-		Line      *int   `json:"line"`
-		StartLine *int   `json:"start_line"`
-		Side      string `json:"side"`
-		Body      string `json:"body"`
-		User      struct {
+		Path        string `json:"path"`
+		Line        *int   `json:"line"`
+		StartLine   *int   `json:"start_line"`
+		OrigLine    *int   `json:"original_line"`
+		OrigSHA     string `json:"original_commit_id"`
+		SubjectType string `json:"subject_type"`
+		Side        string `json:"side"`
+		Body        string `json:"body"`
+		User        struct {
 			Login string `json:"login"`
 		} `json:"user"`
 	}
@@ -186,20 +192,32 @@ func (g *GitHub) Comments(ctx context.Context, pr PullRequest) ([]LineComment, e
 	var comments []LineComment
 	for _, page := range pages {
 		for _, c := range page {
-			if c.Line == nil || *c.Line == 0 || c.Path == "" {
-				continue // outdated: the line is gone from the current diff
+			if c.Path == "" {
+				continue // nothing to anchor it to, not even a file
 			}
-			lc := LineComment{Path: c.Path, Line: *c.Line, Side: c.Side, Author: c.User.Login, Body: strings.TrimSpace(c.Body)}
-			if c.StartLine != nil && *c.StartLine > 0 && *c.StartLine < lc.Line {
-				lc.StartLine = *c.StartLine
-			}
+			lc := LineComment{Path: c.Path, Side: c.Side, Author: c.User.Login, Body: normalizeBody(c.Body)}
 			if lc.Side == "" {
 				lc.Side = "RIGHT"
+			}
+			switch {
+			case c.SubjectType == "file":
+				// a comment on the file itself, it never had a line
+			case c.Line != nil && *c.Line > 0:
+				lc.Line = *c.Line
+				if c.StartLine != nil && *c.StartLine > 0 && *c.StartLine < lc.Line {
+					lc.StartLine = *c.StartLine
+				}
+			default:
+				// GitHub reports no current line: the code it sat on changed
+				lc.Outdated, lc.OrigSHA = true, c.OrigSHA
+				if c.OrigLine != nil {
+					lc.OrigLine = *c.OrigLine
+				}
 			}
 			comments = append(comments, lc)
 		}
 	}
-	return comments, nil
+	return reanchor(ctx, g.run, g.dir, pr, comments), nil
 }
 
 // ListOpen returns the repository's open pull requests, newest first.
@@ -228,4 +246,76 @@ func (g *GitHub) ListOpen(ctx context.Context) ([]Summary, error) {
 		list = append(list, Summary{Number: p.Number, Title: strings.TrimSpace(p.Title), Author: p.Author.Login, Branch: p.HeadRefName, Draft: p.IsDraft})
 	}
 	return list, nil
+}
+
+// Since resolves what an incremental review starts from. An empty rev asks
+// GitHub for the commit this user last submitted a review on.
+func (g *GitHub) Since(ctx context.Context, pr PullRequest, rev string) (Baseline, error) {
+	if rev == "" {
+		last, err := g.lastReviewed(ctx, pr)
+		if err != nil || last == "" {
+			return Baseline{}, err
+		}
+		rev = last
+	}
+	return baselineFor(ctx, g.run, g.dir, pr, rev)
+}
+
+// lastReviewed is the commit the authenticated user last submitted a review
+// on, empty when there is none. Pending reviews are drafts and are skipped, a
+// dismissed one still says what was last looked at.
+func (g *GitHub) lastReviewed(ctx context.Context, pr PullRequest) (string, error) {
+	login, err := g.login(ctx)
+	if err != nil || login == "" {
+		return "", err
+	}
+	endpoint := fmt.Sprintf("repos/%s/%s/pulls/%d/reviews", pr.Owner, pr.Repo, pr.Number)
+	out, err := g.run(ctx, g.dir, "gh", "", "api", "--paginate", "--slurp", "-H", "Accept: application/vnd.github+json", endpoint)
+	if err != nil {
+		return "", fmt.Errorf("list reviews: %w", err)
+	}
+	if strings.TrimSpace(out) == "" {
+		return "", nil
+	}
+	var pages [][]struct {
+		ID          int64  `json:"id"`
+		State       string `json:"state"`
+		CommitID    string `json:"commit_id"`
+		SubmittedAt string `json:"submitted_at"`
+		User        struct {
+			Login string `json:"login"`
+		} `json:"user"`
+	}
+	if err := json.Unmarshal([]byte(out), &pages); err != nil {
+		return "", fmt.Errorf("parse reviews: %w", err)
+	}
+	var bestAt string
+	var bestID int64
+	var commit string
+	for _, page := range pages {
+		for _, r := range page {
+			if r.User.Login != login || r.CommitID == "" || r.State == "PENDING" {
+				continue
+			}
+			if cmp.Or(cmp.Compare(r.SubmittedAt, bestAt), cmp.Compare(r.ID, bestID)) > 0 {
+				bestAt, bestID, commit = r.SubmittedAt, r.ID, r.CommitID
+			}
+		}
+	}
+	return commit, nil
+}
+
+// login is the user gh acts as.
+func (g *GitHub) login(ctx context.Context) (string, error) {
+	out, err := g.run(ctx, g.dir, "gh", "", "api", "user")
+	if err != nil {
+		return "", fmt.Errorf("current user: %w", err)
+	}
+	var v struct {
+		Login string `json:"login"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		return "", fmt.Errorf("parse current user: %w", err)
+	}
+	return v.Login, nil
 }

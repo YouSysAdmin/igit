@@ -112,7 +112,7 @@ func (m *Model) moveDiffCursorUpWithHunks(hunks []int) {
 		return
 	}
 	// if we're at the first line and there's a file-level annotation, go to it
-	if m.nav.diffCursor >= 0 && m.hasFileAnnotation() {
+	if m.nav.diffCursor >= 0 && m.hasFileRow() {
 		m.nav.diffCursor = -1
 	}
 }
@@ -252,7 +252,7 @@ func (m Model) worthRollingBack(walked, rows int) bool {
 // if a file-level annotation exists, the cursor goes to -1 (file annotation line).
 func (m *Model) moveDiffCursorToStart() {
 	m.nav.onAnnotationRow = false
-	if m.hasFileAnnotation() {
+	if m.hasFileRow() {
 		m.nav.diffCursor = -1
 		m.syncViewportToCursor()
 		return

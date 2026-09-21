@@ -30,7 +30,7 @@ func filePickerModel(files []string) Model {
 func TestModel_JumpFileOpensPickerAndLoadsSelection(t *testing.T) {
 	m := filePickerModel([]string{"a.go", "b.go", "c.go"})
 	m.layout.focus = paneTree
-	m.pendingAnnotJump = &annot.Annotation{File: "c.go", Line: 1}
+	m.pendingAnnotJump = &annotJump{Annotation: annot.Annotation{File: "c.go", Line: 1}}
 	pendingHunk := true
 	m.nav.pendingHunkJump = &pendingHunk
 
@@ -75,7 +75,7 @@ func TestModel_JumpFilePrintableNavigationRunesFilter(t *testing.T) {
 func TestModel_JumpFileCurrentSelectionFocusesDiffWithoutReload(t *testing.T) {
 	m := filePickerModel([]string{"a.go", "b.go"})
 	m.layout.focus = paneTree
-	m.pendingAnnotJump = &annot.Annotation{File: "b.go", Line: 1}
+	m.pendingAnnotJump = &annotJump{Annotation: annot.Annotation{File: "b.go", Line: 1}}
 	pendingHunk := false
 	m.nav.pendingHunkJump = &pendingHunk
 	m.openFilePicker()

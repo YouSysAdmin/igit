@@ -202,6 +202,9 @@ func (m Model) reviewRows() []overlay.InfoRow {
 		return nil
 	}
 	var rows []overlay.InfoRow
+	if cfg.Baseline != "" {
+		rows = append(rows, overlay.InfoRow{Label: "since", Value: cfg.Baseline, MutedSuffix: cfg.Ref})
+	}
 	if f := m.reviewListFlag(cfg.Only); f != "" {
 		rows = append(rows, overlay.InfoRow{Label: "only", Value: f})
 	}

@@ -227,7 +227,7 @@ func TestModel_JumpToAnnotation_StalePendingGuard(t *testing.T) {
 
 	t.Run("stale pending jump is ignored when file does not match", func(t *testing.T) {
 		// set pending for b.go but simulate a.go being loaded
-		m.pendingAnnotJump = &annot.Annotation{File: "b.go", Line: 1, Type: "+"}
+		m.pendingAnnotJump = &annotJump{Annotation: annot.Annotation{File: "b.go", Line: 1, Type: "+"}}
 		m.file.loadSeq++
 		loadMsg := fileLoadedMsg{file: "a.go", seq: m.file.loadSeq, lines: diffs["a.go"]}
 		result, _ := m.Update(loadMsg)
@@ -238,7 +238,7 @@ func TestModel_JumpToAnnotation_StalePendingGuard(t *testing.T) {
 	})
 
 	t.Run("n key clears pending jump", func(t *testing.T) {
-		m.pendingAnnotJump = &annot.Annotation{File: "b.go", Line: 1, Type: "+"}
+		m.pendingAnnotJump = &annotJump{Annotation: annot.Annotation{File: "b.go", Line: 1, Type: "+"}}
 		m.layout.focus = paneDiff
 		result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 		model := result.(Model)
@@ -246,7 +246,7 @@ func TestModel_JumpToAnnotation_StalePendingGuard(t *testing.T) {
 	})
 
 	t.Run("p key clears pending jump", func(t *testing.T) {
-		m.pendingAnnotJump = &annot.Annotation{File: "b.go", Line: 1, Type: "+"}
+		m.pendingAnnotJump = &annotJump{Annotation: annot.Annotation{File: "b.go", Line: 1, Type: "+"}}
 		result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
 		model := result.(Model)
 		assert.Nil(t, model.pendingAnnotJump)
@@ -267,14 +267,14 @@ func TestModel_PendingAnnotJump_ClearedByTreeNav(t *testing.T) {
 	m.layout.focus = paneTree
 
 	t.Run("tree j clears pending jump", func(t *testing.T) {
-		m.pendingAnnotJump = &annot.Annotation{File: "b.go", Line: 1, Type: "+"}
+		m.pendingAnnotJump = &annotJump{Annotation: annot.Annotation{File: "b.go", Line: 1, Type: "+"}}
 		result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 		model := result.(Model)
 		assert.Nil(t, model.pendingAnnotJump)
 	})
 
 	t.Run("tree k clears pending jump", func(t *testing.T) {
-		m.pendingAnnotJump = &annot.Annotation{File: "b.go", Line: 1, Type: "+"}
+		m.pendingAnnotJump = &annotJump{Annotation: annot.Annotation{File: "b.go", Line: 1, Type: "+"}}
 		result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 		model := result.(Model)
 		assert.Nil(t, model.pendingAnnotJump)
@@ -295,7 +295,7 @@ func TestModel_PendingAnnotJump_ClearedByFilterToggle(t *testing.T) {
 
 	// add annotation so filter has something to toggle
 	m.store.Add(annot.Annotation{File: "a.go", Line: 1, Type: "+", Comment: "note"})
-	m.pendingAnnotJump = &annot.Annotation{File: "b.go", Line: 1, Type: "+"}
+	m.pendingAnnotJump = &annotJump{Annotation: annot.Annotation{File: "b.go", Line: 1, Type: "+"}}
 	m.layout.focus = paneDiff
 	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
 	model := result.(Model)
@@ -324,7 +324,7 @@ func TestModel_PositionOnAnnotation_CollapsedMode(t *testing.T) {
 	m.modes.collapsed.expandedHunks = make(map[int]bool)
 
 	a := annot.Annotation{File: "a.go", Line: 2, Type: "-"}
-	m.positionOnAnnotation(a)
+	m.positionOnAnnotation(annotJump{Annotation: a})
 
 	// hunk should be expanded so the remove line is visible
 	assert.Equal(t, 2, m.nav.diffCursor)
@@ -354,7 +354,7 @@ func TestModel_PositionOnAnnotation_DeleteOnlyHunk(t *testing.T) {
 	m.modes.collapsed.expandedHunks = make(map[int]bool)
 
 	a := annot.Annotation{File: "a.go", Line: 1, Type: "-"}
-	m.positionOnAnnotation(a)
+	m.positionOnAnnotation(annotJump{Annotation: a})
 
 	// hunk must be expanded so the actual line and annotation are visible
 	assert.Equal(t, 1, m.nav.diffCursor)
@@ -362,4 +362,63 @@ func TestModel_PositionOnAnnotation_DeleteOnlyHunk(t *testing.T) {
 	hunkStart := m.hunkStartFor(m.nav.diffCursor, hunks)
 	assert.True(t, m.modes.collapsed.expandedHunks[hunkStart], "delete-only hunk should be expanded after jump")
 	assert.False(t, m.isDeleteOnlyPlaceholder(m.nav.diffCursor, hunks), "line should not be a placeholder after expansion")
+}
+
+// TestBuildAnnotListItems_includesRequestComments covers the @ popup listing
+// everything attached to the review, not just what this session typed.
+func TestBuildAnnotListItems_includesRequestComments(t *testing.T) {
+	store := annot.NewStore()
+	store.Add(annot.Annotation{File: "a.go", Line: 5, Type: "+", Comment: "mine"})
+	m := testNewModel(t, plainRenderer(), store, noopHighlighter(), ModelConfig{RemoteNotes: []RemoteNote{
+		{File: "a.go", Line: 5, Side: "RIGHT", Author: "alice", Body: "theirs on the same line"},
+		{File: "a.go", Line: 2, Side: "LEFT", Author: "bob", Body: "on a removed line"},
+		{File: "b.go", Author: "carol", Body: "rewritten since", Outdated: true, OrigLine: 73},
+		{File: "z.go", Line: 1, Side: "RIGHT", Author: "dan", Body: "another file"},
+	}})
+
+	items := m.buildAnnotListItems()
+	got := make([][2]any, len(items))
+	for i, it := range items {
+		got[i] = [2]any{it.File, it.Line}
+	}
+	assert.Equal(t, [][2]any{
+		{"a.go", 2}, {"a.go", 5}, {"a.go", 5}, {"b.go", 0}, {"z.go", 1},
+	}, got, "files alphabetical, lines ascending, file-level first")
+
+	assert.False(t, items[1].remote, "our own annotation comes before the request's on the same line")
+	assert.Equal(t, "mine", items[1].Comment)
+	assert.True(t, items[2].remote)
+	assert.Equal(t, "@alice: theirs on the same line", items[2].Comment)
+	assert.Equal(t, "-", items[0].Type, "a comment on a removed line reads on the old side")
+	assert.Equal(t, "LEFT", items[0].side)
+	assert.Equal(t, "(outdated b.go:73) @carol: rewritten since", items[3].Comment,
+		"an outdated comment is listed and says where it was written")
+
+	spec := m.buildAnnotListSpec()
+	require.Len(t, spec.Items, 5, "the popup shows every one of them")
+	assert.Equal(t, "RIGHT", spec.Items[2].Side, "the jump target carries the side it is numbered on")
+}
+
+// TestResolveJumpIndex_requestCommentSides covers a request comment naming only
+// a side: its line is either a changed row or a context row.
+func TestResolveJumpIndex_requestCommentSides(t *testing.T) {
+	m := testNewModel(t, plainRenderer(), annot.NewStore(), noopHighlighter(), ModelConfig{})
+	m.file.name = "a.go"
+	m.file.lines = []git.DiffLine{
+		{OldNum: 1, NewNum: 1, Content: "ctx", ChangeType: git.ChangeContext},
+		{OldNum: 2, Content: "gone", ChangeType: git.ChangeRemove},
+		{NewNum: 2, Content: "new", ChangeType: git.ChangeAdd},
+	}
+
+	add := annotJump{Annotation: annot.Annotation{Line: 2, Type: "+"}, side: "RIGHT"}
+	assert.Equal(t, 2, m.resolveJumpIndex(add))
+
+	removed := annotJump{Annotation: annot.Annotation{Line: 2, Type: "-"}, side: "LEFT"}
+	assert.Equal(t, 1, m.resolveJumpIndex(removed))
+
+	ctx := annotJump{Annotation: annot.Annotation{Line: 1, Type: "+"}, side: "RIGHT"}
+	assert.Equal(t, 0, m.resolveJumpIndex(ctx), "a line the author did not touch is a context row")
+
+	gone := annotJump{Annotation: annot.Annotation{Line: 99, Type: "+"}, side: "RIGHT"}
+	assert.Equal(t, -1, m.resolveJumpIndex(gone), "the walker skips what it cannot show")
 }

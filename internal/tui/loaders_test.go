@@ -2061,7 +2061,7 @@ func TestModel_HandleFileLoaded_StartAtChange(t *testing.T) {
 
 	t.Run("annotation jump wins", func(t *testing.T) {
 		m := load(t, true, withChange, func(m *Model) {
-			m.pendingAnnotJump = &annot.Annotation{File: "a.go", Line: 41, Type: string(git.ChangeContext)}
+			m.pendingAnnotJump = &annotJump{Annotation: annot.Annotation{File: "a.go", Line: 41, Type: string(git.ChangeContext)}}
 		})
 		assert.Equal(t, 2, m.nav.diffCursor, "annotation target overrides start-at-change")
 		assert.Nil(t, m.pendingAnnotJump)
