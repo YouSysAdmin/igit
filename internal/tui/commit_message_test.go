@@ -96,6 +96,7 @@ func TestCommitModel_CommitEditorDirect(t *testing.T) {
 	require.Len(t, repo.CommitEditorCmdCalls(), 1)
 	assert.Empty(t, repo.CommitEditorCmdCalls()[0].Seed)
 	assert.False(t, repo.CommitEditorCmdCalls()[0].O.Amend)
+	c.Update(cmd())
 
 	repo.CommitEditorCmdFunc = func(gitops.CommitOpts, string) (*exec.Cmd, func(), error) {
 		return nil, func() {}, errors.New("no tmp")
@@ -157,7 +158,7 @@ func TestCommitModel_AmendMenu(t *testing.T) {
 	assert.Equal(t, "last subject", c.overlay.(*overlay.Manager).PromptValue())
 	c.Update(keyRunes(" v2"))
 	cmd = c.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	cmd()
+	c.Update(cmd())
 	require.Len(t, repo.CommitCalls(), 2)
 	assert.Equal(t, "last subject v2\n\nlast body", repo.CommitCalls()[1].Msg)
 	assert.True(t, repo.CommitCalls()[1].O.Amend)
@@ -174,6 +175,7 @@ func TestCommitModel_AmendMenu(t *testing.T) {
 	require.Len(t, calls, 1)
 	assert.Equal(t, "last subject\n\nlast body", calls[0].Seed)
 	assert.True(t, calls[0].O.Amend)
+	c.Update(cmd())
 
 	// unborn branch: nothing to amend
 	c.status.Head.Unborn = true
@@ -200,4 +202,70 @@ func TestCommitModel_PromptHelpers(t *testing.T) {
 	assert.Empty(t, bodyOf("a"))
 	c := newTestCommit(t, newRepoMock(sampleStatus()))
 	assert.Nil(t, c.handlePromptSubmitted("unknown", "x"))
+}
+
+func TestCommitModel_CommitProcessMirrorsStderr(t *testing.T) {
+	repo := newRepoMock(sampleStatus())
+	c := newTestCommit(t, repo)
+	loadAll(t, c)
+	var launched *exec.Cmd
+	c.run = captureRunner(&launched)
+	cmd := c.Update(keyRunes("C"))
+	require.NotNil(t, cmd)
+	require.NotNil(t, launched)
+	assert.NotNil(t, launched.Stderr, "stderr is mirrored so a hook's complaint survives the screen switch")
+	assert.Nil(t, launched.Stdout, "the editor keeps stdout as a tty")
+	assert.Equal(t, "commit", c.busy)
+	c.Update(cmd())
+	assert.Empty(t, c.busy)
+	assert.Contains(t, c.statusBarText(), "commit done")
+
+	// a hook rejecting the editor commit: its output lands in the popup
+	c.run = func(cmd *exec.Cmd, done func(error) tea.Msg) tea.Cmd {
+		return func() tea.Msg {
+			_, _ = cmd.Stderr.Write([]byte("gofmt: a.go needs formatting\n"))
+			return done(errors.New("exit status 1"))
+		}
+	}
+	c.Update(c.Update(keyRunes("C"))())
+	require.Equal(t, overlay.KindError, c.overlay.Kind())
+	assert.Contains(t, c.View(), "commit failed")
+	assert.Contains(t, c.View(), "gofmt: a.go needs formatting")
+	c.overlay.Close()
+
+	// leaving the editor with an empty message is an abort, not an error
+	c.run = func(cmd *exec.Cmd, done func(error) tea.Msg) tea.Cmd {
+		return func() tea.Msg {
+			_, _ = cmd.Stderr.Write([]byte("Aborting commit due to empty commit message.\n"))
+			return done(errors.New("exit status 1"))
+		}
+	}
+	c.Update(c.Update(keyRunes("C"))())
+	assert.False(t, c.overlay.Active())
+	assert.Contains(t, c.statusBarText(), "commit aborted: empty message")
+}
+
+func TestCommitModel_CommitRefusedWhileBusy(t *testing.T) {
+	repo := newRepoMock(sampleStatus())
+	c := newTestCommit(t, repo)
+	loadAll(t, c)
+	c.Update(c.Update(keyRunes("c"))())
+	c.Update(keyRunes("slow hook"))
+	cmd := c.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	require.NotNil(t, cmd)
+	assert.Equal(t, "commit", c.busy)
+	assert.Contains(t, c.statusBarText(), "commit running")
+
+	// a second commit, a stage and an editor commit all wait for it
+	assert.Nil(t, c.Update(keyRunes(" ")))
+	assert.Contains(t, c.statusBarText(), "commit in progress")
+	assert.Nil(t, c.Update(keyRunes("C")))
+	assert.Empty(t, repo.CommitEditorCmdCalls())
+	assert.Nil(t, c.Update(keyRunes("c")), "the prompt does not open while the commit runs")
+	assert.False(t, c.overlay.Active())
+
+	c.Update(cmd())
+	assert.Empty(t, c.busy)
+	assert.Contains(t, c.statusBarText(), "commit done")
+	require.Len(t, repo.CommitCalls(), 1)
 }

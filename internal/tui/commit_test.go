@@ -266,13 +266,13 @@ func TestCommitModel_StageToggle(t *testing.T) {
 	// unstaged row -> stage
 	c.list.SelectByKey("u:new.txt")
 	cmd = c.Update(keyRunes(" "))
-	cmd()
+	c.Update(cmd())
 	require.Len(t, repo.StageFilesCalls(), 1)
 	assert.Equal(t, []string{"new.txt"}, repo.StageFilesCalls()[0].Paths)
 
 	// a / u operate on everything
-	c.Update(keyRunes("a"))()
-	c.Update(keyRunes("u"))()
+	c.Update(c.Update(keyRunes("a"))())
+	c.Update(c.Update(keyRunes("u"))())
 	assert.Len(t, repo.StageAllCalls(), 1)
 	assert.Len(t, repo.UnstageAllCalls(), 1)
 }
@@ -326,7 +326,7 @@ func TestCommitModel_DiscardFlow(t *testing.T) {
 	c.Update(keyRunes("u"))
 	cmd := c.Update(keyRunes("y"))
 	require.NotNil(t, cmd)
-	cmd()
+	c.Update(cmd())
 	require.Len(t, repo.DiscardCalls(), 1)
 	assert.Equal(t, "both.go", repo.DiscardCalls()[0].F.Path)
 	assert.Equal(t, gitops.DiscardUnstaged, repo.DiscardCalls()[0].Scope)

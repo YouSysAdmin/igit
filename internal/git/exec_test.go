@@ -119,4 +119,5 @@ func TestCommand_isInteractive(t *testing.T) {
 	assert.Equal(t, []string{"git", "commit", "--amend"}, cmd.Args)
 	assert.Contains(t, cmd.Env, "GIT_SEQUENCE_EDITOR=:")
 	assert.NotContains(t, cmd.Env, "GIT_TERMINAL_PROMPT=0")
+	assert.NotContains(t, cmd.Env, "GIT_LITERAL_PATHSPECS=1", "hooks and the editor inherit the environment")
 }

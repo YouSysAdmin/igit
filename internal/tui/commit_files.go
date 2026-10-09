@@ -214,6 +214,10 @@ func (c *CommitModel) applyDiffViewToggle(action keymap.Action) {
 // handleRepoAction routes the repository-wide actions: commit flows, the
 // stash menu and sync.
 func (c *CommitModel) handleRepoAction(action keymap.Action) tea.Cmd {
+	if c.busy != "" {
+		c.hint = c.busy + " in progress, wait for it to finish"
+		return nil
+	}
 	switch action { //nolint:exhaustive // only the repo actions reach here
 	case keymap.ActionCommit:
 		return c.prepareCommitPrompt(false)
@@ -699,6 +703,9 @@ func (c *CommitModel) openInEditor() tea.Cmd {
 	cmd, err := c.editor.SourceCommand(path, line)
 	if err != nil {
 		c.hint = "cannot open editor: " + err.Error()
+		return nil
+	}
+	if !c.beginOp("editor") {
 		return nil
 	}
 	restore := c.mouseTracking

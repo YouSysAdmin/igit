@@ -66,7 +66,8 @@ type RunOpts struct {
 	// GlobPathspecs keeps git's default pathspec magic instead of forcing
 	// GIT_LITERAL_PATHSPECS=1. `git stash push` runs sub-commands with its own
 	// pathspecs internally and silently drops untracked files under the
-	// literal setting.
+	// literal setting, and hooks inherit the variable, so commands that take
+	// no path arguments but run hooks (commit) must not set it either.
 	GlobPathspecs bool
 }
 
@@ -77,7 +78,7 @@ func (r *Runner) Run(ctx context.Context, o RunOpts, args ...string) (string, er
 	cmd.Dir = r.workDir
 	cmd.Env = r.env(o.Background, o.ExtraEnv, true)
 	if o.GlobPathspecs {
-		cmd.Env = slices.DeleteFunc(cmd.Env, func(kv string) bool { return strings.HasPrefix(kv, "GIT_LITERAL_PATHSPECS=") })
+		cmd.Env = withoutLiteralPathspecs(cmd.Env)
 	}
 	cmd.Stdin = o.Stdin
 	var stdout, stderr bytes.Buffer
@@ -98,13 +99,21 @@ func (r *Runner) Run(ctx context.Context, o RunOpts, args ...string) (string, er
 
 // Command returns an interactive git command bound to the working tree, for
 // operations that must own the terminal (editor commits, push/pull with
-// credential prompts). GIT_TERMINAL_PROMPT stays enabled. The caller runs it
-// through tea.ExecProcess.
+// credential prompts). GIT_TERMINAL_PROMPT stays enabled. Interactive
+// commands take no path arguments, and the editor, the hooks and the remote
+// helpers they spawn must see the user's own pathspec settings, so the
+// literal-pathspec variable is left out. The caller runs it through
+// tea.ExecProcess.
 func (r *Runner) Command(extraEnv []string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(context.Background(), "git", args...) //nolint:gosec // args are constructed internally, never from user text
 	cmd.Dir = r.workDir
-	cmd.Env = r.env(false, extraEnv, false)
+	cmd.Env = withoutLiteralPathspecs(r.env(false, extraEnv, false))
 	return cmd
+}
+
+// withoutLiteralPathspecs drops the literal-pathspec setting from env.
+func withoutLiteralPathspecs(env []string) []string {
+	return slices.DeleteFunc(env, func(kv string) bool { return strings.HasPrefix(kv, "GIT_LITERAL_PATHSPECS=") })
 }
 
 // env builds the process environment: the literal-pathspec environment plus,

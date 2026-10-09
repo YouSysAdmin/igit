@@ -1,6 +1,7 @@
 package gitops
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/yousysadmin/igit/internal/git"
 )
 
 func TestCommit_e2e(t *testing.T) {
@@ -73,6 +76,27 @@ func TestCommit_hooksAndNoVerify_e2e(t *testing.T) {
 	err := g.Commit(ctx, "blocked", CommitOpts{})
 	require.Error(t, err, "pre-commit hook rejects")
 	require.NoError(t, g.Commit(ctx, "forced", CommitOpts{NoVerify: true}))
+}
+
+func TestCommit_hookOutputAndEnvironment_e2e(t *testing.T) {
+	g := setupRepo(t)
+	dir := g.WorkDir()
+	ctx := t.Context()
+	// the hook reports on stdout like most hook runners do, and lists the
+	// staged files through a glob pathspec, which an inherited literal
+	// setting would turn into no match at all
+	script := "#!/bin/sh\necho 'lint: trailing whitespace in a.txt'\n" +
+		"echo \"staged: [$(git diff --cached --name-only -- '*.txt')]\"\nexit 1\n"
+	hook := filepath.Join(dir, ".git", "hooks", "pre-commit")
+	require.NoError(t, os.WriteFile(hook, []byte(script), 0o700)) //nolint:gosec // hook must be executable
+	writeRepoFile(t, dir, "a.txt", "changed\n")
+	require.NoError(t, g.StageFiles(ctx, []string{"a.txt"}))
+	err := g.Commit(ctx, "blocked", CommitOpts{})
+	gerr, ok := errors.AsType[*git.Error](err)
+	require.True(t, ok, "%v", err)
+	assert.Contains(t, gerr.Stderr, "lint: trailing whitespace in a.txt", "hook stdout reaches the error")
+	assert.Contains(t, gerr.Stderr, "staged: [a.txt]", "hook sees git's default pathspec handling")
+	assert.Contains(t, gerr.Detail(), "$ git commit")
 }
 
 func TestCommitEditorCmd(t *testing.T) {

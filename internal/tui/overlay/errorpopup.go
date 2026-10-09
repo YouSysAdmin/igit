@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/yousysadmin/igit/internal/keymap"
 	"github.com/yousysadmin/igit/internal/tui/style"
@@ -80,6 +81,26 @@ func (e *errorOverlay) handleMouse(msg tea.MouseMsg) Outcome {
 	return Outcome{Kind: OutcomeNone}
 }
 
+// plainOutput prepares process output for the popup: colors are stripped,
+// CRLF pairs collapse to newlines, and of a line redrawn with carriage returns
+// (a progress meter) only the final state remains. Indentation is kept so
+// tracebacks and aligned hook reports stay readable.
+func plainOutput(s string) string {
+	s = ansi.Strip(s)
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.TrimRight(s, "\n")
+	if !strings.Contains(s, "\r") {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if _, after, ok := strings.CutLast(line, "\r"); ok {
+			lines[i] = after
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (e *errorOverlay) render(ctx RenderCtx, mgr *Manager) string {
 	e.popupWidth = max(min(ctx.Width-errorMargin, errorMaxWidth), errorMinWidth)
 	width := e.popupWidth - errorBorderPad
@@ -87,8 +108,8 @@ func (e *errorOverlay) render(ctx RenderCtx, mgr *Manager) string {
 	if e.spec.Summary != "" {
 		body = append(body, string(ctx.Resolver.Color(style.ColorKeyRemoveLineFg))+e.spec.Summary+string(style.ResetFg), "")
 	}
-	for line := range strings.SplitSeq(strings.TrimRight(e.spec.Detail, "\n"), "\n") {
-		body = append(body, wrapLines(line, width)...)
+	for line := range strings.SplitSeq(plainOutput(e.spec.Detail), "\n") {
+		body = append(body, strings.Split(ansi.Hardwrap(line, width, true), "\n")...)
 	}
 	e.viewport = max(ctx.Height-errorChromeLines, 1)
 	if maxOffset := max(len(body)-e.viewport, 0); e.offset > maxOffset {

@@ -1,7 +1,10 @@
 package tui
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -145,7 +148,11 @@ func (c *CommitModel) commitWith(msg string, opts gitops.CommitOpts) tea.Cmd {
 		}
 		return c.runProcess(name, cmd, cleanup)
 	}
-	return c.runOp(name, func(ctx context.Context) error { return c.repo.Commit(ctx, msg, opts) })
+	run := c.runOp(name, func(ctx context.Context) error { return c.repo.Commit(ctx, msg, opts) })
+	if run != nil {
+		c.hint = name + " running"
+	}
+	return run
 }
 
 // commitInEditor opens an interactive git commit whose message editor is
@@ -168,14 +175,26 @@ func (c *CommitModel) commitInEditorWith(opts gitops.CommitOpts, seed string) te
 }
 
 // runProcess hands an interactive git command to the process runner and
-// cleans up after it exits.
+// cleans up after it exits. stderr is mirrored into a buffer so a hook's
+// output can be shown once the alternate screen is back. stdout stays on the
+// terminal untouched because the editor needs a tty there.
 func (c *CommitModel) runProcess(name string, cmd *exec.Cmd, cleanup func()) tea.Cmd {
+	if !c.beginOp(name) {
+		if cleanup != nil {
+			cleanup()
+		}
+		return nil
+	}
+	var buf bytes.Buffer
+	if cmd.Stderr == nil {
+		cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+	}
 	restore := c.mouseTracking
 	return c.run(cmd, func(runErr error) tea.Msg {
 		if cleanup != nil {
 			cleanup()
 		}
-		return commitProcessDoneMsg{name: name, err: runErr, restoreMouse: restore}
+		return commitProcessDoneMsg{name: name, err: runErr, output: buf.String(), restoreMouse: restore}
 	})
 }
 

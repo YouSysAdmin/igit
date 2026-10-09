@@ -45,10 +45,11 @@ func (o CommitOpts) args() []string {
 // unicode messages need no shell quoting. The message is cleaned up as
 // whitespace only (trailing blanks, collapsed empty lines) so lines starting
 // with # survive. An empty msg with NoEdit (amend) keeps the previous message.
-// Hooks run unless NoVerify is set.
+// Hooks run unless NoVerify is set, and they inherit the environment, so the
+// command takes no path arguments and keeps git's default pathspec handling.
 func (g *Git) Commit(ctx context.Context, msg string, o CommitOpts) error {
 	args := o.args()
-	opts := git.RunOpts{}
+	opts := git.RunOpts{GlobPathspecs: true}
 	if msg != "" {
 		args = append(args, "--cleanup=whitespace", "-F", "-")
 		opts.Stdin = strings.NewReader(msg)

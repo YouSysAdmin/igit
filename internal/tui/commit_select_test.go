@@ -56,7 +56,7 @@ func TestCommitModel_StageSingleLine(t *testing.T) {
 	c.Update(keyRunes("j")) // -b
 	cmd := c.Update(keyRunes(" "))
 	require.NotNil(t, cmd)
-	cmd()
+	c.Update(cmd())
 	calls := repoOf(c).ApplyLinesCalls()
 	require.Len(t, calls, 1)
 	assert.Equal(t, gitops.LineRequest{Raw: twoBlockRaw, Path: "f.go", Indices: []int{5}, Op: gitops.StageLines}, calls[0].Req)
@@ -81,7 +81,7 @@ func TestCommitModel_RangeSelection(t *testing.T) {
 
 	cmd := c.Update(keyRunes(" "))
 	require.NotNil(t, cmd)
-	cmd()
+	c.Update(cmd())
 	calls := repoOf(c).ApplyLinesCalls()
 	require.Len(t, calls, 1)
 	assert.Equal(t, []int{5, 6}, calls[0].Req.Indices, "the context row in the range is not a change")
@@ -113,7 +113,7 @@ func TestCommitModel_HunkSelection(t *testing.T) {
 	assert.Equal(t, 5, first)
 	assert.Equal(t, 6, last)
 	cmd := c.Update(keyRunes(" "))
-	cmd()
+	c.Update(cmd())
 	assert.Equal(t, []int{8, 9}, repoOf(c).ApplyLinesCalls()[0].Req.Indices)
 	// on a context row hunk mode falls back to the cursor line
 	c.Update(keyRunes("v"))
@@ -130,7 +130,7 @@ func TestCommitModel_UnstageLinesFromStagedView(t *testing.T) {
 	c.installRaw(gitops.DiffSpec{Path: "f.go", Cached: true}, twoBlockRaw)
 	c.Update(keyRunes("j"))
 	cmd := c.Update(keyRunes(" "))
-	cmd()
+	c.Update(cmd())
 	assert.Equal(t, gitops.UnstageLines, repoOf(c).ApplyLinesCalls()[0].Req.Op)
 	// discard is refused on the staged side
 	c.Update(keyRunes("d"))
@@ -151,7 +151,7 @@ func TestCommitModel_DiscardLinesFlow(t *testing.T) {
 	c.Update(keyRunes("d"))
 	cmd := c.Update(keyRunes("y"))
 	require.NotNil(t, cmd)
-	cmd()
+	c.Update(cmd())
 	calls := repoOf(c).ApplyLinesCalls()
 	require.Len(t, calls, 1)
 	assert.Equal(t, gitops.DiscardLines, calls[0].Req.Op)
@@ -258,7 +258,7 @@ func TestCommitModel_StageHunkKey(t *testing.T) {
 	c.Update(keyRunes("j")) // row 3 (+B): s stages the whole change block, as s marks it in review mode
 	cmd := c.Update(keyRunes("s"))
 	require.NotNil(t, cmd)
-	cmd()
+	c.Update(cmd())
 	calls := repoOf(c).ApplyLinesCalls()
 	require.Len(t, calls, 1)
 	assert.Equal(t, []int{5, 6}, calls[0].Req.Indices)
@@ -270,7 +270,7 @@ func TestCommitModel_StageHunkKey(t *testing.T) {
 	c.Update(keyRunes("j"))
 	c.Update(keyRunes("j")) // rows 3..6
 	cmd = c.Update(keyRunes("s"))
-	cmd()
+	c.Update(cmd())
 	assert.Equal(t, []int{6, 8, 9}, repoOf(c).ApplyLinesCalls()[1].Req.Indices)
 
 	// J/K scroll the diff like in review mode and never start a selection

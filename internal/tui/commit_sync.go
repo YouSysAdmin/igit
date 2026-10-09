@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -15,11 +16,11 @@ import (
 	"github.com/yousysadmin/igit/internal/tui/overlay"
 )
 
-// syncDoneMsg reports a finished push/pull/fetch with the stderr git printed.
+// syncDoneMsg reports a finished push/pull/fetch with the output git printed.
 type syncDoneMsg struct {
 	name         string
 	err          error
-	stderr       string
+	output       string
 	restoreMouse bool
 }
 
@@ -55,7 +56,8 @@ func (c *CommitModel) handleInProgressMenu(choice string) (tea.Cmd, bool) {
 			c.hint = err.Error()
 			return nil, true
 		}
-		return c.runSync("continue "+string(state), cmd), true
+		// the continue opens an editor, which needs stdout to stay a tty
+		return c.runSync("continue "+string(state), cmd, false), true
 	}
 	return nil, false
 }
@@ -66,13 +68,13 @@ func (c *CommitModel) handleInProgressMenu(choice string) (tea.Cmd, bool) {
 func (c *CommitModel) handleSyncAction(action keymap.Action) tea.Cmd {
 	switch action { //nolint:exhaustive // only the sync actions reach here
 	case keymap.ActionFetch:
-		return c.runSync("fetch", c.repo.FetchCmd(true, true))
+		return c.runSync("fetch", c.repo.FetchCmd(true, true), true)
 	case keymap.ActionPull:
 		if c.status.Head.Upstream == "" {
 			c.hint = "no upstream configured: set one with U on the Branches tab"
 			return nil
 		}
-		return c.runSync("pull", c.repo.PullCmd(gitops.PullOpts{}))
+		return c.runSync("pull", c.repo.PullCmd(gitops.PullOpts{}), true)
 	case keymap.ActionPush:
 		c.openPushMenu()
 	case keymap.ActionAbortOrContinue:
@@ -101,39 +103,74 @@ func (c *CommitModel) openPushMenu() {
 func (c *CommitModel) handlePushMenu(choice string) (tea.Cmd, bool) {
 	switch choice {
 	case "push":
-		return c.runSync("push", c.repo.PushCmd(gitops.PushOpts{})), true
+		return c.runSync("push", c.repo.PushCmd(gitops.PushOpts{}), true), true
 	case "push-upstream":
-		return c.runSync("push", c.repo.PushCmd(gitops.PushOpts{Remote: "origin", SetUpstream: true})), true
+		return c.runSync("push", c.repo.PushCmd(gitops.PushOpts{Remote: "origin", SetUpstream: true}), true), true
 	case "push-force":
 		remote := ""
 		if c.status.Head.Upstream == "" {
 			remote = "origin"
 		}
-		return c.runSync("force push", c.repo.PushCmd(gitops.PushOpts{Remote: remote, ForceWithLease: true})), true
+		return c.runSync("force push", c.repo.PushCmd(gitops.PushOpts{Remote: remote, ForceWithLease: true}), true), true
 	}
 	return nil, false
 }
 
 // runSync executes an interactive git command, mirroring its stderr into a
-// buffer so the result can be summarized afterwards.
-func (c *CommitModel) runSync(name string, cmd *exec.Cmd) tea.Cmd {
-	var buf bytes.Buffer
+// buffer so the result can be summarized afterwards. withStdout mirrors
+// stdout as well: git does not redirect a pre-push hook's stdout to stderr,
+// so its report would otherwise vanish with the terminal screen. Commands
+// that open an editor keep stdout as a tty.
+func (c *CommitModel) runSync(name string, cmd *exec.Cmd, withStdout bool) tea.Cmd {
+	if !c.beginOp(name) {
+		return nil
+	}
+	var buf syncBuffer
 	if cmd.Stderr == nil {
 		cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
 	}
+	if withStdout && cmd.Stdout == nil {
+		cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
+	}
+	c.hint = name + " running"
 	restore := c.mouseTracking
 	return c.run(cmd, func(runErr error) tea.Msg {
-		return syncDoneMsg{name: name, err: runErr, stderr: buf.String(), restoreMouse: restore}
+		return syncDoneMsg{name: name, err: runErr, output: buf.String(), restoreMouse: restore}
 	})
 }
 
+// syncBuffer collects the mirrored streams of one process. stdout and stderr
+// write from different goroutines, so the buffer is locked.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Write(p) // bytes.Buffer never fails on write
+	return len(p), nil
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func (c *CommitModel) handleSyncDone(msg syncDoneMsg) tea.Cmd {
+	c.endOp()
 	var cmds []tea.Cmd
 	if msg.restoreMouse {
 		cmds = append(cmds, tea.EnableMouseCellMotion)
 	}
 	if msg.err != nil {
-		c.overlay.OpenError(overlay.ErrorSpec{Title: msg.name + " failed", Summary: msg.err.Error(), Detail: strings.TrimSpace(msg.stderr)})
+		detail := strings.TrimSpace(msg.output)
+		if detail == "" {
+			detail = msg.err.Error() + ", no output"
+		}
+		c.overlay.OpenError(overlay.ErrorSpec{Title: msg.name + " failed", Summary: msg.err.Error(), Detail: detail})
 	} else {
 		c.hint = msg.name + " done"
 	}

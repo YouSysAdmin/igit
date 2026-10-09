@@ -98,6 +98,7 @@ type CommitModel struct {
 	width, height int
 	ready         bool
 	hint          string        // transient status-bar message, cleared on next key press
+	busy          string        // name of the write operation or interactive process in flight
 	pending       pendingAction // action awaiting a confirmation popup
 	styleGen      uint64        // review style generation last applied via setStyle
 	diffStyleGen  uint64        // diff pane style generation last reported to App (theme picked in commit mode)
