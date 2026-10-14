@@ -145,16 +145,9 @@ func (g *Git) HasStagedChanges(ctx context.Context) (bool, error) {
 	return false, err
 }
 
-// GPGSignEnabled reports whether commit.gpgsign is on, in which case a commit
-// may need the terminal for a passphrase prompt.
-func (g *Git) GPGSignEnabled(ctx context.Context) bool {
-	out, err := g.Run(ctx, git.RunOpts{Background: true, OkExitCodes: []int{1}}, "config", "--get", "--type=bool", "commit.gpgsign")
-	return err == nil && strings.TrimSpace(out) == "true"
-}
-
 // CommitFileCmd returns an interactive `git commit -F <tmp>` that records msg
-// without opening an editor but with the terminal attached, for repositories
-// whose commit.gpgsign needs a passphrase prompt. cleanup removes the temp file.
+// without opening an editor but with the terminal attached, so hook output and
+// a GPG passphrase prompt reach the user. cleanup removes the temp file.
 func (g *Git) CommitFileCmd(o CommitOpts, msg string) (cmd *exec.Cmd, cleanup func(), err error) {
 	f, ferr := os.CreateTemp("", "igit-commit-msg-*.txt")
 	if ferr != nil {

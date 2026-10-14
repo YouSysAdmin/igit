@@ -133,26 +133,27 @@ func (c *CommitModel) handlePromptEditor(id, value string) tea.Cmd {
 	return c.commitInEditor(seed)
 }
 
-// commitWith runs a non-interactive commit, or an interactive one when GPG
-// signing may need the terminal for a passphrase.
+// commitWith runs the commit with the terminal attached, so hook output shows
+// while it runs and a GPG passphrase prompt can reach the user. An empty msg
+// with NoEdit keeps HEAD's message without opening an editor.
 func (c *CommitModel) commitWith(msg string, opts gitops.CommitOpts) tea.Cmd {
 	name := "commit"
 	if opts.Amend {
 		name = "amend"
 	}
-	if msg != "" && c.repo.GPGSignEnabled(context.Background()) {
-		cmd, cleanup, err := c.repo.CommitFileCmd(opts, msg)
-		if err != nil {
-			c.hint = "commit: " + err.Error()
-			return nil
-		}
-		return c.runProcess(name, cmd, cleanup)
+	var cmd *exec.Cmd
+	var cleanup func()
+	var err error
+	if msg != "" {
+		cmd, cleanup, err = c.repo.CommitFileCmd(opts, msg)
+	} else {
+		cmd, cleanup, err = c.repo.CommitEditorCmd(opts, "")
 	}
-	run := c.runOp(name, func(ctx context.Context) error { return c.repo.Commit(ctx, msg, opts) })
-	if run != nil {
-		c.hint = name + " running"
+	if err != nil {
+		c.hint = name + ": " + err.Error()
+		return nil
 	}
-	return run
+	return c.runProcess(name, cmd, cleanup)
 }
 
 // commitInEditor opens an interactive git commit whose message editor is

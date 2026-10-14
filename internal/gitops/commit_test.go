@@ -153,14 +153,6 @@ func TestCommit_unbornBranch_e2e(t *testing.T) {
 	assert.Equal(t, "first", last)
 }
 
-func TestGPGSignEnabled(t *testing.T) {
-	g := setupRepo(t)
-	assert.False(t, g.GPGSignEnabled(t.Context()))
-	gitRun(t, g.WorkDir(), "config", "commit.gpgsign", "true")
-	assert.True(t, g.GPGSignEnabled(t.Context()))
-	assert.False(t, New(t.TempDir()).GPGSignEnabled(t.Context()))
-}
-
 func TestCommitOpts_args(t *testing.T) {
 	assert.Equal(t, []string{"commit"}, CommitOpts{}.args())
 	assert.Equal(t, []string{"commit", "--amend", "--no-edit", "--no-verify", "--signoff", "--allow-empty"},

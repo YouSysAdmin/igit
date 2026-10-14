@@ -27,6 +27,8 @@ func TestCommitModel_CommitPromptFlow(t *testing.T) {
 	repo := newRepoMock(sampleStatus())
 	c := newTestCommit(t, repo)
 	loadAll(t, c)
+	var launched *exec.Cmd
+	c.run = captureRunner(&launched)
 
 	// c gathers prompt data asynchronously, then opens the prompt
 	cmd := c.Update(keyRunes("c"))
@@ -44,11 +46,11 @@ func TestCommitModel_CommitPromptFlow(t *testing.T) {
 	cmd = c.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	require.NotNil(t, cmd)
 	assert.False(t, c.overlay.Active())
-	done := cmd()
-	require.Len(t, repo.CommitCalls(), 1)
-	assert.Equal(t, "feat: thing", repo.CommitCalls()[0].Msg)
-	assert.Equal(t, gitops.CommitOpts{}, repo.CommitCalls()[0].O)
-	refresh := c.Update(done)
+	require.Len(t, repo.CommitFileCmdCalls(), 1)
+	assert.Equal(t, "feat: thing", repo.CommitFileCmdCalls()[0].Msg)
+	assert.Equal(t, gitops.CommitOpts{}, repo.CommitFileCmdCalls()[0].O)
+	assert.Equal(t, []string{"true", "file", "feat: thing"}, launched.Args, "the commit runs in the terminal")
+	refresh := c.Update(cmd())
 	assert.NotNil(t, refresh)
 	assert.Equal(t, "commit done", c.statusBarText())
 }
@@ -82,7 +84,7 @@ func TestCommitModel_CommitPromptToEditor(t *testing.T) {
 	assert.Equal(t, []string{"true", "editor", "wip"}, launched.Args)
 	refresh := c.Update(cmd())
 	assert.NotNil(t, refresh, "returning from the editor refreshes")
-	assert.Empty(t, repo.CommitCalls())
+	assert.Empty(t, repo.CommitFileCmdCalls())
 }
 
 func TestCommitModel_CommitEditorDirect(t *testing.T) {
@@ -105,22 +107,10 @@ func TestCommitModel_CommitEditorDirect(t *testing.T) {
 	assert.Contains(t, c.statusBarText(), "no tmp")
 }
 
-func TestCommitModel_GPGCommitGoesThroughTerminal(t *testing.T) {
+func TestCommitModel_CommitFileCmdError(t *testing.T) {
 	repo := newRepoMock(sampleStatus())
-	repo.GPGSignEnabledFunc = func(context.Context) bool { return true }
 	c := newTestCommit(t, repo)
 	loadAll(t, c)
-	var launched *exec.Cmd
-	c.run = captureRunner(&launched)
-	c.Update(c.Update(keyRunes("c"))())
-	c.Update(keyRunes("signed"))
-	cmd := c.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	require.NotNil(t, cmd)
-	require.Len(t, repo.CommitFileCmdCalls(), 1)
-	assert.Equal(t, "signed", repo.CommitFileCmdCalls()[0].Msg)
-	assert.Empty(t, repo.CommitCalls())
-	c.Update(cmd())
-
 	repo.CommitFileCmdFunc = func(gitops.CommitOpts, string) (*exec.Cmd, func(), error) {
 		return nil, func() {}, errors.New("tmp fail")
 	}
@@ -130,10 +120,32 @@ func TestCommitModel_GPGCommitGoesThroughTerminal(t *testing.T) {
 	assert.Contains(t, c.statusBarText(), "tmp fail")
 }
 
+func TestCommitModel_AmendKeepUsesConfiguredOpts(t *testing.T) {
+	repo := newRepoMock(sampleStatus())
+	c := newTestCommit(t, repo)
+	loadAll(t, c)
+	c.noVerify = true
+	var launched *exec.Cmd
+	c.run = captureRunner(&launched)
+	c.Update(keyRunes("A"))
+	c.Update(keyRunes("k"))
+	cmd := c.Update(keyRunes("y"))
+	require.NotNil(t, cmd)
+	require.Len(t, repo.CommitEditorCmdCalls(), 1)
+	call := repo.CommitEditorCmdCalls()[0]
+	assert.Empty(t, call.Seed)
+	assert.Equal(t, gitops.CommitOpts{Amend: true, NoEdit: true, NoVerify: true}, call.O)
+	require.NotNil(t, launched)
+	c.Update(cmd())
+	assert.Equal(t, "amend done", c.statusBarText())
+}
+
 func TestCommitModel_AmendMenu(t *testing.T) {
 	repo := newRepoMock(sampleStatus())
 	c := newTestCommit(t, repo)
 	loadAll(t, c)
+	var launched *exec.Cmd
+	c.run = captureRunner(&launched)
 
 	// keep message: menu -> confirm -> commit --amend --no-edit
 	assert.Nil(t, c.Update(keyRunes("A")))
@@ -142,11 +154,10 @@ func TestCommitModel_AmendMenu(t *testing.T) {
 	require.Equal(t, overlay.KindConfirm, c.overlay.Kind())
 	cmd := c.Update(keyRunes("y"))
 	require.NotNil(t, cmd)
-	done := cmd()
-	require.Len(t, repo.CommitCalls(), 1)
-	assert.Empty(t, repo.CommitCalls()[0].Msg)
-	assert.Equal(t, gitops.CommitOpts{Amend: true, NoEdit: true}, repo.CommitCalls()[0].O)
-	c.Update(done)
+	require.Len(t, repo.CommitEditorCmdCalls(), 1)
+	assert.Empty(t, repo.CommitEditorCmdCalls()[0].Seed)
+	assert.Equal(t, gitops.CommitOpts{Amend: true, NoEdit: true}, repo.CommitEditorCmdCalls()[0].O)
+	c.Update(cmd())
 	assert.Equal(t, "amend done", c.statusBarText())
 
 	// edit message: prompt prefilled with the old subject, body preserved on submit
@@ -159,20 +170,19 @@ func TestCommitModel_AmendMenu(t *testing.T) {
 	c.Update(keyRunes(" v2"))
 	cmd = c.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	c.Update(cmd())
-	require.Len(t, repo.CommitCalls(), 2)
-	assert.Equal(t, "last subject v2\n\nlast body", repo.CommitCalls()[1].Msg)
-	assert.True(t, repo.CommitCalls()[1].O.Amend)
-	assert.False(t, repo.CommitCalls()[1].O.NoEdit)
+	require.Len(t, repo.CommitFileCmdCalls(), 1)
+	assert.Equal(t, "last subject v2\n\nlast body", repo.CommitFileCmdCalls()[0].Msg)
+	assert.True(t, repo.CommitFileCmdCalls()[0].O.Amend)
+	assert.False(t, repo.CommitFileCmdCalls()[0].O.NoEdit)
 
 	// amend prompt -> editor carries subject and body as the seed
-	var launched *exec.Cmd
-	c.run = captureRunner(&launched)
 	c.Update(keyRunes("A"))
 	c.Update(c.Update(keyRunes("e"))())
 	cmd = c.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
 	require.NotNil(t, cmd)
 	calls := repo.CommitEditorCmdCalls()
-	require.Len(t, calls, 1)
+	require.Len(t, calls, 2)
+	calls = calls[1:]
 	assert.Equal(t, "last subject\n\nlast body", calls[0].Seed)
 	assert.True(t, calls[0].O.Amend)
 	c.Update(cmd())
@@ -249,12 +259,13 @@ func TestCommitModel_CommitRefusedWhileBusy(t *testing.T) {
 	repo := newRepoMock(sampleStatus())
 	c := newTestCommit(t, repo)
 	loadAll(t, c)
+	var launched *exec.Cmd
+	c.run = captureRunner(&launched)
 	c.Update(c.Update(keyRunes("c"))())
 	c.Update(keyRunes("slow hook"))
 	cmd := c.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	require.NotNil(t, cmd)
 	assert.Equal(t, "commit", c.busy)
-	assert.Contains(t, c.statusBarText(), "commit running")
 
 	// a second commit, a stage and an editor commit all wait for it
 	assert.Nil(t, c.Update(keyRunes(" ")))
@@ -267,5 +278,5 @@ func TestCommitModel_CommitRefusedWhileBusy(t *testing.T) {
 	c.Update(cmd())
 	assert.Empty(t, c.busy)
 	assert.Contains(t, c.statusBarText(), "commit done")
-	require.Len(t, repo.CommitCalls(), 1)
+	require.Len(t, repo.CommitFileCmdCalls(), 1)
 }

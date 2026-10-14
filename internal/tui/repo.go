@@ -29,13 +29,11 @@ type Stager interface {
 
 // Committer creates and amends commits.
 type Committer interface {
-	Commit(ctx context.Context, msg string, o gitops.CommitOpts) error
 	CommitEditorCmd(o gitops.CommitOpts, seed string) (cmd *exec.Cmd, cleanup func(), err error)
 	CommitFileCmd(o gitops.CommitOpts, msg string) (cmd *exec.Cmd, cleanup func(), err error)
 	LastCommitMessage(ctx context.Context) (string, error)
 	CommitMessages(ctx context.Context, n int) ([]string, error)
 	HasStagedChanges(ctx context.Context) (bool, error)
-	GPGSignEnabled(ctx context.Context) bool
 }
 
 // Stasher manages the stash.

@@ -666,7 +666,9 @@ func (c *CommitModel) handleConfirmed(id string) tea.Cmd {
 		return c.discardSelectedLines(p.indices)
 	}
 	if id == "amend" {
-		return c.commitWith("", gitops.CommitOpts{Amend: true, NoEdit: true})
+		opts := c.commitOpts(true)
+		opts.NoEdit = true
+		return c.commitWith("", opts)
 	}
 	if cmd, ok := c.handleHistoryConfirmed(id, p); ok {
 		return cmd

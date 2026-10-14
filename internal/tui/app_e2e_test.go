@@ -173,6 +173,9 @@ func TestApp_E2E_ReviewMarksFlowIntoCommitMode(t *testing.T) {
 	app.commit.list.SelectByKey("u:new.txt")
 	app = keys(t, app, " ")
 	assert.Contains(t, gitOutput(t, dir, "status", "--porcelain"), "A  new.txt")
+	app.commit.run = func(cmd *exec.Cmd, done func(error) tea.Msg) tea.Cmd {
+		return func() tea.Msg { return done(cmd.Run()) }
+	}
 	app = keys(t, app, "c")
 	require.Equal(t, overlay.KindPrompt, app.commit.overlay.Kind())
 	app = keys(t, app, "feat: e2e", "enter")

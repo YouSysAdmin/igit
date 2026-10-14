@@ -61,7 +61,6 @@ func newRepoMock(st gitops.Status) *mocks.RepoMock {
 		CheckoutRemoteFunc: func(context.Context, string, bool) error { return nil },
 		DiscardFunc:        func(context.Context, gitops.StatusEntry, gitops.DiscardScope, bool) error { return nil },
 		ApplyLinesFunc:     func(context.Context, gitops.LineRequest) error { return nil },
-		CommitFunc:         func(context.Context, string, gitops.CommitOpts) error { return nil },
 		CommitEditorCmdFunc: func(o gitops.CommitOpts, seed string) (*exec.Cmd, func(), error) {
 			return exec.Command("true", "editor", seed), func() {}, nil //nolint:gosec // test stub, fixed program
 		},
@@ -73,7 +72,6 @@ func newRepoMock(st gitops.Status) *mocks.RepoMock {
 			return []string{"last subject\n\nlast body", "older"}, nil
 		},
 		HasStagedChangesFunc: func(context.Context) (bool, error) { return true, nil },
-		GPGSignEnabledFunc:   func(context.Context) bool { return false },
 		BranchesFunc: func(context.Context) ([]gitops.Branch, error) {
 			return []gitops.Branch{
 				{Name: "main", Head: true, Upstream: "origin/main", Ahead: 1, Hash: "aaa", Subject: "s"},

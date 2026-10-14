@@ -34,9 +34,6 @@ import (
 //			CheckoutRemoteFunc: func(ctx context.Context, remoteRef string, force bool) error {
 //				panic("mock out the CheckoutRemote method")
 //			},
-//			CommitFunc: func(ctx context.Context, msg string, o gitops.CommitOpts) error {
-//				panic("mock out the Commit method")
-//			},
 //			CommitEditorCmdFunc: func(o gitops.CommitOpts, seed string) (*exec.Cmd, func(), error) {
 //				panic("mock out the CommitEditorCmd method")
 //			},
@@ -66,9 +63,6 @@ import (
 //			},
 //			FetchCmdFunc: func(all bool, prune bool) *exec.Cmd {
 //				panic("mock out the FetchCmd method")
-//			},
-//			GPGSignEnabledFunc: func(ctx context.Context) bool {
-//				panic("mock out the GPGSignEnabled method")
 //			},
 //			HasStagedChangesFunc: func(ctx context.Context) (bool, error) {
 //				panic("mock out the HasStagedChanges method")
@@ -176,9 +170,6 @@ type RepoMock struct {
 	// CheckoutRemoteFunc mocks the CheckoutRemote method.
 	CheckoutRemoteFunc func(ctx context.Context, remoteRef string, force bool) error
 
-	// CommitFunc mocks the Commit method.
-	CommitFunc func(ctx context.Context, msg string, o gitops.CommitOpts) error
-
 	// CommitEditorCmdFunc mocks the CommitEditorCmd method.
 	CommitEditorCmdFunc func(o gitops.CommitOpts, seed string) (*exec.Cmd, func(), error)
 
@@ -208,9 +199,6 @@ type RepoMock struct {
 
 	// FetchCmdFunc mocks the FetchCmd method.
 	FetchCmdFunc func(all bool, prune bool) *exec.Cmd
-
-	// GPGSignEnabledFunc mocks the GPGSignEnabled method.
-	GPGSignEnabledFunc func(ctx context.Context) bool
 
 	// HasStagedChangesFunc mocks the HasStagedChanges method.
 	HasStagedChangesFunc func(ctx context.Context) (bool, error)
@@ -335,15 +323,6 @@ type RepoMock struct {
 			// Force is the force argument value.
 			Force bool
 		}
-		// Commit holds details about calls to the Commit method.
-		Commit []struct {
-			// Ctx is the ctx argument value.
-			Ctx context.Context
-			// Msg is the msg argument value.
-			Msg string
-			// O is the o argument value.
-			O gitops.CommitOpts
-		}
 		// CommitEditorCmd holds details about calls to the CommitEditorCmd method.
 		CommitEditorCmd []struct {
 			// O is the o argument value.
@@ -419,11 +398,6 @@ type RepoMock struct {
 			All bool
 			// Prune is the prune argument value.
 			Prune bool
-		}
-		// GPGSignEnabled holds details about calls to the GPGSignEnabled method.
-		GPGSignEnabled []struct {
-			// Ctx is the ctx argument value.
-			Ctx context.Context
 		}
 		// HasStagedChanges holds details about calls to the HasStagedChanges method.
 		HasStagedChanges []struct {
@@ -633,7 +607,6 @@ type RepoMock struct {
 	lockBranches              sync.RWMutex
 	lockCheckout              sync.RWMutex
 	lockCheckoutRemote        sync.RWMutex
-	lockCommit                sync.RWMutex
 	lockCommitEditorCmd       sync.RWMutex
 	lockCommitFileCmd         sync.RWMutex
 	lockCommitFiles           sync.RWMutex
@@ -644,7 +617,6 @@ type RepoMock struct {
 	lockDeleteBranch          sync.RWMutex
 	lockDiscard               sync.RWMutex
 	lockFetchCmd              sync.RWMutex
-	lockGPGSignEnabled        sync.RWMutex
 	lockHasStagedChanges      sync.RWMutex
 	lockLastCommitMessage     sync.RWMutex
 	lockLog                   sync.RWMutex
@@ -856,46 +828,6 @@ func (mock *RepoMock) CheckoutRemoteCalls() []struct {
 	mock.lockCheckoutRemote.RLock()
 	calls = mock.calls.CheckoutRemote
 	mock.lockCheckoutRemote.RUnlock()
-	return calls
-}
-
-// Commit calls CommitFunc.
-func (mock *RepoMock) Commit(ctx context.Context, msg string, o gitops.CommitOpts) error {
-	if mock.CommitFunc == nil {
-		panic("RepoMock.CommitFunc: method is nil but Repo.Commit was just called")
-	}
-	callInfo := struct {
-		Ctx context.Context
-		Msg string
-		O   gitops.CommitOpts
-	}{
-		Ctx: ctx,
-		Msg: msg,
-		O:   o,
-	}
-	mock.lockCommit.Lock()
-	mock.calls.Commit = append(mock.calls.Commit, callInfo)
-	mock.lockCommit.Unlock()
-	return mock.CommitFunc(ctx, msg, o)
-}
-
-// CommitCalls gets all the calls that were made to Commit.
-// Check the length with:
-//
-//	len(mockedRepo.CommitCalls())
-func (mock *RepoMock) CommitCalls() []struct {
-	Ctx context.Context
-	Msg string
-	O   gitops.CommitOpts
-} {
-	var calls []struct {
-		Ctx context.Context
-		Msg string
-		O   gitops.CommitOpts
-	}
-	mock.lockCommit.RLock()
-	calls = mock.calls.Commit
-	mock.lockCommit.RUnlock()
 	return calls
 }
 
@@ -1268,38 +1200,6 @@ func (mock *RepoMock) FetchCmdCalls() []struct {
 	mock.lockFetchCmd.RLock()
 	calls = mock.calls.FetchCmd
 	mock.lockFetchCmd.RUnlock()
-	return calls
-}
-
-// GPGSignEnabled calls GPGSignEnabledFunc.
-func (mock *RepoMock) GPGSignEnabled(ctx context.Context) bool {
-	if mock.GPGSignEnabledFunc == nil {
-		panic("RepoMock.GPGSignEnabledFunc: method is nil but Repo.GPGSignEnabled was just called")
-	}
-	callInfo := struct {
-		Ctx context.Context
-	}{
-		Ctx: ctx,
-	}
-	mock.lockGPGSignEnabled.Lock()
-	mock.calls.GPGSignEnabled = append(mock.calls.GPGSignEnabled, callInfo)
-	mock.lockGPGSignEnabled.Unlock()
-	return mock.GPGSignEnabledFunc(ctx)
-}
-
-// GPGSignEnabledCalls gets all the calls that were made to GPGSignEnabled.
-// Check the length with:
-//
-//	len(mockedRepo.GPGSignEnabledCalls())
-func (mock *RepoMock) GPGSignEnabledCalls() []struct {
-	Ctx context.Context
-} {
-	var calls []struct {
-		Ctx context.Context
-	}
-	mock.lockGPGSignEnabled.RLock()
-	calls = mock.calls.GPGSignEnabled
-	mock.lockGPGSignEnabled.RUnlock()
 	return calls
 }
 
