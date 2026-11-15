@@ -197,3 +197,24 @@ func TestCommitModel_DiffPaneConflictCursorOutsideABlock(t *testing.T) {
 	assert.Contains(t, c.statusBarText(), "1 conflict")
 	assert.Empty(t, repo.ResolveConflictRegionCalls())
 }
+
+func TestCommitModel_EnterInEntryDiffBrowsesFiles(t *testing.T) {
+	c := newTestCommit(t, newRepoMock(sampleStatus()))
+	c.diff.diffSource = &fakeRenderer{}
+	loadAll(t, c)
+
+	press(t, c, "3")
+	press(t, c, "l")
+	require.Equal(t, focusDiff, c.focus)
+
+	press(t, c, "enter")
+	require.NotNil(t, c.hist.detail, "enter opens the file list of the commit")
+	assert.Equal(t, focusSide, c.focus)
+	assert.Empty(t, c.hint)
+
+	// inside a file of the entry there is nothing further to open
+	press(t, c, "enter")
+	require.Equal(t, focusDiff, c.focus)
+	press(t, c, "enter")
+	assert.Contains(t, c.hint, "not implemented")
+}

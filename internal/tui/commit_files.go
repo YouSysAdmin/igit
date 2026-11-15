@@ -420,11 +420,31 @@ func (c *CommitModel) handleDiffKey(action keymap.Action) tea.Cmd {
 		c.showSidePane()
 		c.focus = focusSide
 		c.diff.syncViewportToCursor()
+	case keymap.ActionConfirm:
+		if c.browsableEntry() {
+			return c.browseEntryFiles()
+		}
+		c.hint = unavailableHere(action)
 	case "":
 	default:
 		c.hint = unavailableHere(action)
 	}
 	return nil
+}
+
+// browsableEntry reports whether the diff pane shows a whole commit or stash
+// whose files can be listed.
+func (c *CommitModel) browsableEntry() bool {
+	return (c.tab == tabLog || c.tab == tabStash) && c.hist.detail == nil
+}
+
+// browseEntryFiles opens the file list of the entry shown in the diff pane
+// and hands the focus to it.
+func (c *CommitModel) browseEntryFiles() tea.Cmd {
+	c.showSidePane()
+	c.focus = focusSide
+	c.clearSelection()
+	return c.enterDetail()
 }
 
 // moveList moves the side-pane cursor and loads the newly selected diff.
